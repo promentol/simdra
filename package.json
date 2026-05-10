@@ -22,11 +22,7 @@
     "./wasm/simdra.wasm": "./dist/wasm/simdra.wasm"
   },
   "files": [
-    "dist",
-    "src",
-    "zig",
-    "vite.config.js",
-    "node-zigar.config.json"
+    "dist"
   ],
   "scripts": {
     "build": "npm run build:core && npm run build:wasm",
@@ -47,6 +43,25 @@
     "docs:deploy": "npm run docs:build && cd docs && wrangler deploy"
   },
   "homepage": "https://bynarek.com/simdra/",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/promentol/simdra.git"
+  },
+  "bugs": {
+    "url": "https://github.com/promentol/simdra/issues"
+  },
+  "author": {
+    "name": "Narek",
+    "email": "promentol@gmail.com",
+    "url": "https://github.com/promentol"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "publishConfig": {
+    "access": "public",
+    "provenance": true
+  },
   "keywords": [
     "canvas",
     "simd",
@@ -60,7 +75,7 @@
     "edge",
     "sharp"
   ],
-  "license": "ISC",
+  "license": "MIT",
   "devDependencies": {
     "@cloudflare/workers-types": "^4.20260502.1",
     "@napi-rs/canvas": "^0.1.100",

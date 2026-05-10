@@ -122,7 +122,7 @@ Use `[]const u8`, **not** `[:0]const u8`. zigar's sentinel validator is incompat
 
 ## Adding a new spec member
 
-1. Find the interface in [`specs/`](https://github.com/your-org/simdra/tree/main/specs) and the unchecked member.
+1. Find the interface in [`specs/`](https://github.com/promentol/simdra/tree/main/specs) and the unchecked member.
 2. Decide which folder:
    - Pure drawing/data primitive → `core/Sm*.zig` (static or instance method).
    - Shader / gradient / filter → `effects/`.
@@ -168,8 +168,8 @@ simdra vendors stb_truetype and stb_image. Adding another:
 Right now simdra is in its early days; PRs land via direct review. When opening one:
 
 1. Run `npm run typecheck && npm test && npm run build && npm run test:built`. All four should be green.
-2. Update [`COMPATIBILITY.md`](https://github.com/your-org/simdra/blob/main/COMPATIBILITY.md) if you touched a spec-member.
-3. Update [`CLAUDE.md`](https://github.com/your-org/simdra/blob/main/CLAUDE.md) if you changed conventions or added a folder.
+2. Update [`COMPATIBILITY.md`](https://github.com/promentol/simdra/blob/main/COMPATIBILITY.md) if you touched a spec-member.
+3. Update [`CLAUDE.md`](https://github.com/promentol/simdra/blob/main/CLAUDE.md) if you changed conventions or added a folder.
 4. Tick spec checkboxes in `specs/` for any newly-implemented member.
 
 ## See also

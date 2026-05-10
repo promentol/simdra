@@ -6,7 +6,7 @@ weight: 22
 
 # PDF → PNG via pdfjs-serverless
 
-[`pdfjs-serverless`](https://github.com/unjs/pdfjs-serverless) is Mozilla's pdf.js redistributed for edge runtimes. Pair it with a small canvas-factory shim and simdra renders any PDF page to PNG. Working code in [`examples/pdfjs-serverless/`](https://github.com/narekh/simdra/tree/main/examples/pdfjs-serverless).
+[`pdfjs-serverless`](https://github.com/unjs/pdfjs-serverless) is Mozilla's pdf.js redistributed for edge runtimes. Pair it with a small canvas-factory shim and simdra renders any PDF page to PNG. Working code in [`examples/pdfjs-serverless/`](https://github.com/promentol/simdra/tree/main/examples/pdfjs-serverless).
 
 ## Install
 

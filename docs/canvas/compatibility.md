@@ -4,7 +4,7 @@ description: HTML5 Canvas spec coverage matrix.
 weight: 60
 ---
 
-Side-by-side coverage of the HTML5 Canvas WebIDL surface. Source of truth is [`COMPATIBILITY.md`](https://github.com/your-org/simdra/blob/main/COMPATIBILITY.md) and the per-interface specs under [`specs/`](https://github.com/your-org/simdra/tree/main/specs).
+Side-by-side coverage of the HTML5 Canvas WebIDL surface. Source of truth is [`COMPATIBILITY.md`](https://github.com/promentol/simdra/blob/main/COMPATIBILITY.md) and the per-interface specs under [`specs/`](https://github.com/promentol/simdra/tree/main/specs).
 
 **Legend**
 
@@ -74,4 +74,4 @@ Side-by-side coverage of the HTML5 Canvas WebIDL surface. Source of truth is [`C
 - **`globalCompositeOperation`** supports the full Porter-Duff set; CSS-color-3 modes (`multiply`, `screen`, `overlay`, etc.) are implemented but slower than the Skia/Cairo equivalents pending SIMD-tuning.
 - **Text shaping** is stb_truetype's punch-and-place — no kerning beyond the `kern` table, no GSUB ligatures, no BiDi, no complex script support. Latin and CJK are fine; everything else needs a real shaper (HarfBuzz integration is a roadmap item).
 
-For the line-by-line view, see [`COMPATIBILITY.md`](https://github.com/your-org/simdra/blob/main/COMPATIBILITY.md) in the repo.
+For the line-by-line view, see [`COMPATIBILITY.md`](https://github.com/promentol/simdra/blob/main/COMPATIBILITY.md) in the repo.

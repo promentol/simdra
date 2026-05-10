@@ -89,7 +89,7 @@ export default defineConfig({
     ],
 
     // Replace with the real repo URL when ready.
-    socialLinks: [{ icon: 'github', link: 'https://github.com/your-org/simdra' }],
+    socialLinks: [{ icon: 'github', link: 'https://github.com/promentol/simdra' }],
 
     search: { provider: 'local' },
 
@@ -97,7 +97,7 @@ export default defineConfig({
 
     footer: {
       message:
-        'Released under the ISC License. Vendored stb_truetype + stb_image (public domain).',
+        'Released under the MIT License. Vendored stb_truetype + stb_image (public domain).',
     },
   },
 

@@ -660,7 +660,7 @@ These sharp output APIs require encoders / metadata libraries that aren't in stb
 | `.keepMetadata()` / `.withMetadata()` | Composite of EXIF / XMP / IPTC + density + orientation. |
 | `.joinChannel([m1, m2, ...], opts)` (multi-image) | Single-mask form is supported; libvips's N-band append beyond 4 channels can't be represented. |
 
-For a full coverage matrix including Canvas2D + microsharp divergences from sharp, see [`COMPATIBILITY.md`](https://github.com/narekh/simdra/blob/main/COMPATIBILITY.md).
+For a full coverage matrix including Canvas2D + microsharp divergences from sharp, see [`COMPATIBILITY.md`](https://github.com/promentol/simdra/blob/main/COMPATIBILITY.md).
 
 ---
 
@@ -699,4 +699,4 @@ Both share the Zig core: same decoders, same encoders, same SIMD kernels.
 
 ## Roadmap
 
-Future work — pixel format expansion (F16 / F32 / 10:10:10:2 / single-channel), codec independence (replace stb with pure Zig), and other planned improvements — is tracked in [`Roadmap.md`](https://github.com/narekh/simdra/blob/main/Roadmap.md).
+Future work — pixel format expansion (F16 / F32 / 10:10:10:2 / single-channel), codec independence (replace stb with pure Zig), and other planned improvements — is tracked in [`Roadmap.md`](https://github.com/promentol/simdra/blob/main/Roadmap.md).

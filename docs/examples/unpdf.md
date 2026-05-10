@@ -6,7 +6,7 @@ weight: 23
 
 # PDF → PNG via unpdf
 
-[`unpdf`](https://github.com/unjs/unpdf) is a serverless-friendly pdf.js wrapper with `renderPageAsImage`, `extractText`, and `extractImages` helpers. Hand it simdra via `canvasImport` and you're done. Working code in [`examples/unpdf/`](https://github.com/narekh/simdra/tree/main/examples/unpdf).
+[`unpdf`](https://github.com/unjs/unpdf) is a serverless-friendly pdf.js wrapper with `renderPageAsImage`, `extractText`, and `extractImages` helpers. Hand it simdra via `canvasImport` and you're done. Working code in [`examples/unpdf/`](https://github.com/promentol/simdra/tree/main/examples/unpdf).
 
 ## Install
 

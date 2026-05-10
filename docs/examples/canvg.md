@@ -6,7 +6,7 @@ weight: 21
 
 # SVG → PNG via canvg
 
-[`canvg`](https://github.com/canvg/canvg) renders SVG into a Canvas2D context. Hand it simdra's `createCanvas` and you get SVG → PNG anywhere simdra runs. Working code in [`examples/canvg/`](https://github.com/narekh/simdra/tree/main/examples/canvg).
+[`canvg`](https://github.com/canvg/canvg) renders SVG into a Canvas2D context. Hand it simdra's `createCanvas` and you get SVG → PNG anywhere simdra runs. Working code in [`examples/canvg/`](https://github.com/promentol/simdra/tree/main/examples/canvg).
 
 ## Install
 

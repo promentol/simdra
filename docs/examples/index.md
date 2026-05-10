@@ -25,7 +25,7 @@ For per-runtime install + setup snippets (CF Workers, Vercel Edge, Deno, Bun, br
 
 ## Library integrations
 
-simdra's `createCanvas` matches the [node-canvas](https://github.com/Automattic/node-canvas) signature, so libraries that already accept "any node-canvas-shaped module" plug in cleanly. The three below have working code in the [`examples/`](https://github.com/narekh/simdra/tree/main/examples) folder of the repo.
+simdra's `createCanvas` matches the [node-canvas](https://github.com/Automattic/node-canvas) signature, so libraries that already accept "any node-canvas-shaped module" plug in cleanly. The three below have working code in the [`examples/`](https://github.com/promentol/simdra/tree/main/examples) folder of the repo.
 
 - [**SVG → PNG via `canvg`**](./canvg) — Render any SVG to PNG at the edge. canvg + `@xmldom/xmldom` + simdra in a Cloudflare Worker. No headless browser, no Resvg, ~1 MB total bundle.
 - [**PDF → PNG via `pdfjs-serverless`**](./pdfjs) — Mozilla's pdf.js redistributed for edge runtimes, paired with a custom `SimdraCanvasFactory`. Renders any PDF page to PNG. Drop-in for Cloudflare / Vercel Edge / Deno Deploy.

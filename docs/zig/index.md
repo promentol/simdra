@@ -16,7 +16,7 @@ The "Canvas 2D" and "MicroSharp" bindings you see in the [API docs](/canvas/) ar
 - **Comptime SIMD backend dispatch.** `opts/simd.zig` is a thin comptime facade that picks `opts/neon.zig` on aarch64 and `opts/generic.zig` everywhere else (WASM, x86 baseline). Same shape as Skia's `SkOpts`. Per-arch backends export the same kernel signatures; arch tuning happens by replacing kernels in the matching backend file.
 - **Two consumers, one library.** Same `zig/simdra.zig` entry point is consumed by node-zigar (native Node.js addon, fast iteration via `--loader=node-zigar`) AND by rollup-plugin-zigar (WASM bundle for Workers / browsers). No `if (target == .wasi)` shims in the source — comptime gating where it's needed (`builtin.cpu.arch.isWasm()`), identical Zig everywhere else.
 
-Sharp's image-operations API (~22 ops across geometric, convolution, morphology, tone, histogram, HSV) is implemented from spec; divergences are tracked in [`COMPATIBILITY.md`](https://github.com/narekh/simdra/blob/main/COMPATIBILITY.md). If you want a worked example of "build a real library against a published spec," the commit history is the artefact.
+Sharp's image-operations API (~22 ops across geometric, convolution, morphology, tone, histogram, HSV) is implemented from spec; divergences are tracked in [`COMPATIBILITY.md`](https://github.com/promentol/simdra/blob/main/COMPATIBILITY.md). If you want a worked example of "build a real library against a published spec," the commit history is the artefact.
 
 ## Two-layer design
 

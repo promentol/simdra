@@ -145,7 +145,7 @@ Add simdra as a dependency in your `build.zig.zon`:
 
 ```zig
 .simdra = .{
-    .url = "https://github.com/your-org/simdra/archive/<commit>.tar.gz",
+    .url = "https://github.com/promentol/simdra/archive/<commit>.tar.gz",
     .hash = "...",
 },
 ```

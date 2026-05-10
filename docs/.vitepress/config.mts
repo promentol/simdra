@@ -1,12 +1,20 @@
 import { defineConfig } from 'vitepress';
 
 // VitePress 2 (alpha) — https://vitepress.dev/
+//
+// Production deploy: https://bynarek.com/simdra/
+// All assets are served from the `/simdra/` path prefix. Local `docs:dev`
+// uses the same base — open http://localhost:5173/simdra/ in dev.
 export default defineConfig({
   title: 'simdra',
   description:
-    'SIMD-accelerated 2D canvas + sharp-shaped image processing for Node, browser, and edge runtimes.',
+    'SIMD-accelerated 2D canvas and image manipulation, in a Worker. HTML5 Canvas API + sharp-shaped fluent surface.',
   cleanUrls: true,
   lastUpdated: true,
+  base: '/simdra/',
+  sitemap: {
+    hostname: 'https://bynarek.com/simdra/',
+  },
 
   head: [
     ['meta', { name: 'theme-color', content: '#03a9f4' }],

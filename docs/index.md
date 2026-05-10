@@ -43,9 +43,11 @@ features:
     details: Single core × SIMD × RGBA8 sRGB. No 16-bit / Lab / CMYK, no WebP / AVIF. Small, bounded, auditable.
 ---
 
-<p align="center">
-  <img src="/image.png" alt="simdra — SIMD-accelerated 2D canvas, in a Worker" style="max-width: 100%; border-radius: 8px;" />
-</p>
+<div align="center">
+
+![simdra — SIMD-accelerated 2D canvas, in a Worker](/image.png)
+
+</div>
 
 ## simdra is for the runtimes the multi-threaded image libraries can't reach
 

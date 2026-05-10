@@ -9,6 +9,8 @@
 Cloudflare Workers · browser Web Workers · Vercel Edge · Deno Deploy ·
 any V8 isolate with WASM-SIMD.
 
+📖 **[See the docs → bynarek.com/simdra](https://bynarek.com/simdra/)** — installation, API reference, integration examples.
+
 ```bash
 npm install simdra
 ```
@@ -188,18 +190,17 @@ architecture writeup.
 
 ## Documentation
 
-- [Canvas 2D API](./docs/canvas/index.md) — drawing, paths,
-  transforms, text, images, encoding.
-- [MicroSharp API](./docs/microsharp/index.md) — pipeline,
-  terminals, async patterns, comparison with sharp.
-- [Zig core](./docs/zig/index.md) — Skia-shaped class taxonomy,
-  Scan→Blitter pipeline, SIMD backends, file-is-struct module
-  pattern.
-- [Compatibility matrix](./COMPATIBILITY.md) — HTML5 + sharp spec
-  coverage and divergences.
-- [Roadmap](./Roadmap.md) — pixel format expansion (F16 / F32 /
-  10:10:10:2 / single-channel), codec independence (replace stb
-  with pure Zig).
+📖 **Full docs: [bynarek.com/simdra](https://bynarek.com/simdra/)** — searchable, with the integration examples laid out side-by-side.
+
+Quick links:
+
+- [Installation](https://bynarek.com/simdra/installation) — Cloudflare Workers, Vercel Edge, Deno, Bun, browsers, Web Workers.
+- [Examples](https://bynarek.com/simdra/examples/) — image-resize API, OG cards, avatar pipeline, watermarking, format converter, document & chart renderers, plus canvg / pdfjs-serverless / unpdf integrations.
+- [Canvas 2D API](https://bynarek.com/simdra/canvas/api) — drawing, paths, transforms, text, images, encoding.
+- [MicroSharp API](https://bynarek.com/simdra/microsharp/api) — full sharp-shaped pipeline, all 22 image-ops methods.
+- [Zig core](https://bynarek.com/simdra/zig/) — Skia-shaped class taxonomy, Scan→Blitter pipeline, SIMD backends.
+- [Compatibility matrix](./COMPATIBILITY.md) — HTML5 + sharp spec coverage and divergences.
+- [Roadmap](./Roadmap.md) — pixel format expansion (F16 / F32 / 10:10:10:2 / single-channel), codec independence (replace stb with pure Zig).
 
 ## Marketing reference
 

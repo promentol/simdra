@@ -43,15 +43,22 @@
     "typecheck": "tsc --noEmit",
     "docs:dev": "vitepress dev docs",
     "docs:build": "vitepress build docs",
-    "docs:preview": "vitepress preview docs"
+    "docs:preview": "vitepress preview docs",
+    "docs:deploy": "npm run docs:build && cd docs && wrangler deploy"
   },
+  "homepage": "https://bynarek.com/simdra/",
   "keywords": [
     "canvas",
     "simd",
     "zig",
     "2d",
     "graphics",
-    "wasm"
+    "wasm",
+    "image",
+    "image-processing",
+    "cloudflare-workers",
+    "edge",
+    "sharp"
   ],
   "license": "ISC",
   "devDependencies": {

@@ -1,0 +1,6 @@
+{
+  "$schema": "https://unpkg.com/wrangler/config-schema.json",
+  "name": "simdra-canvg",
+  "main": "worker.js",
+  "compatibility_date": "2025-05-05"
+}

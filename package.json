@@ -1,0 +1,81 @@
+{
+  "name": "simdra",
+  "version": "0.1.0",
+  "description": "SIMD-accelerated 2D canvas and image manipulation, in a Worker. HTML5 Canvas API + sharp-shaped fluent surface. Cloudflare Workers, browsers, edge.",
+  "type": "module",
+  "main": "./dist/core/index.js",
+  "module": "./dist/core/index.js",
+  "types": "./dist/core/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/core/index.d.ts",
+      "default": "./dist/core/index.js"
+    },
+    "./core": {
+      "types": "./dist/core/index.d.ts",
+      "default": "./dist/core/index.js"
+    },
+    "./wasm": {
+      "types": "./dist/wasm/index.d.ts",
+      "default": "./dist/wasm/index.mjs"
+    },
+    "./wasm/simdra.wasm": "./dist/wasm/simdra.wasm"
+  },
+  "files": [
+    "dist",
+    "src",
+    "zig",
+    "vite.config.js",
+    "node-zigar.config.json"
+  ],
+  "scripts": {
+    "build": "npm run build:core && npm run build:wasm",
+    "build:core": "./node_modules/.bin/zigar build && tsc -p tsconfig.core.json && node -e \"const f=require('fs');for(const[p,r] of [['dist/core/index.js','./zig.js'],['dist/core/microsharp/index.js','../zig.js']]) f.writeFileSync(p,f.readFileSync(p,'utf8').replace(/[.][.][/](?:[.][.][/])?zig[/]simdra[.]zig/g, r))\"",
+    "build:wasm": "VITE_TARGET=wasm vite build",
+    "test": "node --loader=node-zigar --no-warnings test/index.js",
+    "test:built": "node test/built.js",
+    "test:sharp": "node --loader=node-zigar --no-warnings test/microsharp_compare.js",
+    "test:leak": "cd zig && zig test leak_test.zig -lc -I .",
+    "test:visual": "npm run build && node --experimental-vm-modules ./node_modules/jest/bin/jest.js",
+    "test:all": "npm run test && npm run test:visual",
+    "bench": "npm run build && node --loader=node-zigar --no-warnings bench/run.js",
+    "bench:resample": "node --loader=node-zigar --no-warnings bench/resample.mjs",
+    "typecheck": "tsc --noEmit",
+    "docs:dev": "vitepress dev docs",
+    "docs:build": "vitepress build docs",
+    "docs:preview": "vitepress preview docs"
+  },
+  "keywords": [
+    "canvas",
+    "simd",
+    "zig",
+    "2d",
+    "graphics",
+    "wasm"
+  ],
+  "license": "ISC",
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4.20260502.1",
+    "@napi-rs/canvas": "^0.1.100",
+    "@types/node": "^25.6.0",
+    "@xmldom/xmldom": "^0.9.10",
+    "canvas": "^3.2.3",
+    "canvg": "^4.0.3",
+    "jest": "^30.3.0",
+    "node-fetch": "^3.3.2",
+    "node-zigar": "^0.15.2",
+    "pdfjs-dist": "^5.7.284",
+    "pdfjs-serverless": "^1.2.3",
+    "sharp": "^0.34.5",
+    "ssim.js": "^3.5.0",
+    "typescript": "^6.0.3",
+    "unpdf": "^1.6.2",
+    "vite": "^8.0.10",
+    "vite-plugin-dts": "^4.5.4",
+    "vitepress": "^2.0.0-alpha.17"
+  },
+  "packageManager": "pnpm@9.15.4+sha512.b2dc20e2fc72b3e18848459b37359a32064663e5627a51e4c74b2c29dd8e8e0491483c3abb40789cfd578bf362fb6ba8261b05f0387d76792ed6e23ea3b1b6a0",
+  "dependencies": {
+    "rollup-plugin-zigar": "^0.15.2"
+  }
+}

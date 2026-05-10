@@ -1,0 +1,6 @@
+{
+  "$schema": "https://unpkg.com/wrangler/config-schema.json",
+  "name": "simdra-unpdf",
+  "main": "index.js",
+  "compatibility_date": "2025-05-05"
+}

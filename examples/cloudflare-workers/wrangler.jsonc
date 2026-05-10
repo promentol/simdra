@@ -1,0 +1,11 @@
+{
+  "$schema": "https://unpkg.com/wrangler/config-schema.json",
+  "name": "simdra-cloudflare-example",
+  "main": "index.js"
+  // "compatibility_date": "2025-05-05",
+  // // simdra's bundle has a dynamic `import("node:worker_threads")` inside
+  // // zigar's runtime (used only when Web Workers are unavailable). Workers
+  // // will never enter that branch, but the static analyzer flags it without
+  // // this flag.
+  // "compatibility_flags": ["nodejs_compat"]
+}

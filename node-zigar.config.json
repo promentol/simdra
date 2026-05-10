@@ -1,0 +1,14 @@
+{
+  "optimize": "ReleaseSmall",
+  "useLibc": true,
+  "evalBranchQuota": 4000000,
+  "modules": {
+    "dist/core/simdra.zigar": {
+      "source": "zig/simdra.zig",
+      "loader": "dist/core/zig.js"
+    }
+  },
+  "targets": [
+    { "platform": "darwin", "arch": "arm64" }
+  ]
+}

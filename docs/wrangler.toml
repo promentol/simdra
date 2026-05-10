@@ -1,0 +1,6 @@
+"$schema" = "../node_modules/wrangler/config-schema.json"
+name = "simdra-docs-website"
+compatibility_date = "2026-04-06"
+
+[assets]
+directory = ".vitepress/dist"   # Folder with your HTML, CSS, JS, images

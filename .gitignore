@@ -17,6 +17,12 @@ dist/
 # npm pack output
 *.tgz
 
+# Local-machine helper scripts (release.sh, smoke.sh, etc.)
+# Track a tracked example template under scripts/ if a script needs
+# to be shared with contributors.
+*.sh
+!scripts/*.sh
+
 # =============================================================================
 # Zig
 # =============================================================================

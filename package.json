@@ -26,7 +26,7 @@
   ],
   "scripts": {
     "build": "npm run build:core && npm run build:wasm",
-    "build:core": "./node_modules/.bin/zigar build && tsc -p tsconfig.core.json && node -e \"const f=require('fs');for(const[p,r] of [['dist/core/index.js','./zig.js'],['dist/core/microsharp/index.js','../zig.js']]) f.writeFileSync(p,f.readFileSync(p,'utf8').replace(/[.][.][/](?:[.][.][/])?zig[/]simdra[.]zig/g, r))\"",
+    "build:core": "zigar build && tsc -p tsconfig.core.json && node -e \"const f=require('fs');for(const[p,r] of [['dist/core/index.js','./zig.js'],['dist/core/microsharp/index.js','../zig.js']]) f.writeFileSync(p,f.readFileSync(p,'utf8').replace(/[.][.][/](?:[.][.][/])?zig[/]simdra[.]zig/g, r))\"",
     "build:wasm": "VITE_TARGET=wasm vite build",
     "test": "node --loader=node-zigar --no-warnings test/index.js",
     "test:built": "node test/built.js",
@@ -59,8 +59,7 @@
     "node": ">=18.0.0"
   },
   "publishConfig": {
-    "access": "public",
-    "provenance": true
+    "access": "public"
   },
   "keywords": [
     "canvas",

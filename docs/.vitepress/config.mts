@@ -38,29 +38,6 @@ export default defineConfig({
         ],
       },
       {
-        text: 'Examples',
-        collapsed: false,
-        items: [
-          { text: 'Overview', link: '/examples/' },
-          { text: 'Image resize API', link: '/examples/resize-api' },
-          { text: 'Open Graph cards', link: '/examples/og-image' },
-          { text: 'Avatar pipeline', link: '/examples/avatar-pipeline' },
-          { text: 'Watermark / logo', link: '/examples/watermark' },
-          { text: 'Format converter', link: '/examples/format-converter' },
-          { text: 'Document renderer', link: '/examples/document-render' },
-          { text: 'Bar chart', link: '/examples/chart' },
-        ],
-      },
-      {
-        text: 'Library integrations',
-        collapsed: false,
-        items: [
-          { text: 'SVG → PNG (canvg)', link: '/examples/canvg' },
-          { text: 'PDF → PNG (pdfjs-serverless)', link: '/examples/pdfjs' },
-          { text: 'PDF → PNG (unpdf)', link: '/examples/unpdf' },
-        ],
-      },
-      {
         text: 'Canvas 2D',
         collapsed: false,
         items: [
@@ -75,6 +52,29 @@ export default defineConfig({
         items: [
           { text: 'Overview', link: '/microsharp/' },
           { text: 'API reference', link: '/microsharp/api' },
+        ],
+      },
+      {
+        text: 'Examples',
+        collapsed: false,
+        items: [
+          { text: 'Overview', link: '/examples/' },
+          { text: 'Open Graph cards', link: '/examples/og-image' },
+          { text: 'Document renderer', link: '/examples/document-render' },
+          { text: 'Bar chart', link: '/examples/chart' },
+          { text: 'Image resize API', link: '/examples/resize-api' },
+          { text: 'Avatar pipeline', link: '/examples/avatar-pipeline' },
+          { text: 'Watermark / logo', link: '/examples/watermark' },
+          { text: 'Format converter', link: '/examples/format-converter' },
+        ],
+      },
+      {
+        text: 'Library integrations',
+        collapsed: false,
+        items: [
+          { text: 'SVG → PNG (canvg)', link: '/examples/canvg' },
+          { text: 'PDF → PNG (pdfjs-serverless)', link: '/examples/pdfjs' },
+          { text: 'PDF → PNG (unpdf)', link: '/examples/unpdf' },
         ],
       },
       {

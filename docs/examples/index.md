@@ -10,18 +10,22 @@ Complete, copy-pasteable integrations grouped by use case. Every example below s
 
 For per-runtime install + setup snippets (CF Workers, Vercel Edge, Deno, Bun, browsers, Web Workers), see [Installation](/installation). The examples here go further — full handlers with parameter parsing, error handling, and content negotiation.
 
-## API endpoints (Workers / Edge)
+## Canvas 2D drawing recipes
+
+Render dynamic images using HTML5 Canvas primitives — gradients, `Path2D`, text, transforms.
+
+- [**Open Graph card generator**](./og-image) — `1200×630` social-card image rendered from query params (`?title=&subtitle=&accent=`). Multi-line text wrap, gradient backgrounds, theme switching.
+- [**Document / invoice renderer**](./document-render) — Canvas 2D drawing chops: gradients, `Path2D`, headers, rectangles, multi-column text. The "build a PDF page in a Worker" pattern.
+- [**Bar chart from JSON**](./chart) — Worker endpoint that takes a JSON payload (`{ labels, values, title }`), renders a chart with axes, gridlines, and gradient bars, returns PNG.
+
+## Image-processing endpoints
+
+Use the `microsharp` (sharp-shaped) surface for decode → transform → re-encode pipelines.
 
 - [**Image resize API**](./resize-api) — accept an image POST or fetched URL, parse `?w=&h=&fit=&q=&format=`, return the resized variant. The bread-and-butter Workers image endpoint.
-- [**Open Graph card generator**](./og-image) — `1200×630` social-card image rendered from query params (`?title=&subtitle=&accent=`). Drawn with Canvas 2D primitives.
 - [**Avatar processing pipeline**](./avatar-pipeline) — multipart upload → autoOrient via EXIF → cover-crop to square → sharpen → JPEG. Worker / Vercel Edge.
 - [**Watermark / branded screenshot**](./watermark) — composite a logo overlay at gravity southeast over an input image. Worker shape and Node CLI shape.
 - [**Format converter**](./format-converter) — any input → PNG / JPEG / BMP / raw based on the request's `Accept` header. Content negotiation done right.
-
-## Drawing-primitive recipes
-
-- [**Document / invoice renderer**](./document-render) — Canvas 2D drawing chops: gradients, `Path2D`, headers, rectangles, multi-column text. The "build a PDF page in a Worker" pattern.
-- [**Bar chart from JSON**](./chart) — Worker endpoint that takes a JSON payload (`{ labels, values, title }`), renders a chart with axes, gridlines, and gradient bars, returns PNG.
 
 ## Library integrations
 

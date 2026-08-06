@@ -7,6 +7,7 @@
 //! Pure value type — no allocator needed.
 
 const std = @import("std");
+const types = @import("types.zig");
 const SmGradient = @import("../effects/SmGradient.zig");
 const SmPattern = @import("../effects/SmPattern.zig");
 
@@ -189,6 +190,13 @@ blend_mode: BlendMode = .src_over,
 /// applies it per pixel after the sampler — so changing `globalAlpha`
 /// between draw calls doesn't require resampling stops.
 global_alpha: u8 = 0xFF,
+/// Destination surface byte order (SkColorType analog). Drives the late
+/// R↔B swizzle of resolved source colors and the choice of the four
+/// lum-asymmetric non-separable blend kernels. Set by `SmCanvas` from
+/// `surface.color_type`; the one-pixel paints the blitter synthesizes
+/// keep the `.rgba8888` default because their colors are already in
+/// surface order (the kernel choice travels separately).
+dst_color_type: types.ColorType = .rgba8888,
 /// Per-paint color transform. Same fold/carry split as `global_alpha`:
 /// solid paints fold it at construction (`SmCanvas.paintFromShader`) and
 /// emit identity here; gradient/pattern/drawImage paints carry it and

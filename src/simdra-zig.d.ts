@@ -279,6 +279,11 @@ declare module '*.zig' {
     ): void;
   }
 
+  // Surface byte order (SkColorType analog): 0 = rgba8888 (always, for
+  // JS-created surfaces), 1 = bgra8888 (Zig-only initWithColorType path —
+  // takes an explicit Allocator, so it has no JS factory).
+  export type SmColorType = 0 | 1;
+
   export interface SmSurface {
     readonly width: number;
     readonly height: number;
@@ -354,10 +359,15 @@ declare module '*.zig' {
   // SmPattern — image tile shader. Backs HTML5 CanvasPattern. Owns its RGBA
   // bytes (snapshot at construction). Construction via SmPattern.create
   // static factory.
+  // Texel filter for SmPattern. Enum integer matches Zig Filter:
+  // 0 = nearest (HTML5-facade default), 1 = bilinear (simdra extension).
+  export type SmPatternFilter = 0 | 1;
+
   export interface SmPattern {
     readonly width: number;
     readonly height: number;
     setTransform(a: number, b: number, c: number, d: number, e: number, f: number): void;
+    setFilter(mode: SmPatternFilter): void;
     deinit(): void;
   }
 

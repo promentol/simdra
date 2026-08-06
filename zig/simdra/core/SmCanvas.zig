@@ -702,12 +702,12 @@ inline fn applyAlphaModulation(color: u32, modulator: u8) u32 {
 /// bit-exact); for `.gradient` / `.pattern` the alpha modulator rides along
 /// on `paint.global_alpha` and is applied per-pixel by `SmBlitter`.
 fn paintForFill(self: *const SmCanvas) SmPaint {
-    return paintFromShader(self.fillStyle, .fill, 0, self.alpha, self.blendMode, self.cxform);
+    return paintFromShader(self.fillStyle, .fill, 0, self.alpha, self.blendMode, self.cxform, self.surface.color_type);
 }
 
 /// Build a stroke SmPaint from the current ctx state.
 fn paintForStroke(self: *const SmCanvas) SmPaint {
-    return paintFromShader(self.strokeStyle, .stroke, self.lineWidth, self.alpha, self.blendMode, self.cxform);
+    return paintFromShader(self.strokeStyle, .stroke, self.lineWidth, self.alpha, self.blendMode, self.cxform, self.surface.color_type);
 }
 
 inline fn paintFromShader(
@@ -717,12 +717,15 @@ inline fn paintFromShader(
     alpha: u8,
     blend_mode: SmPaint.BlendMode,
     cxform: SmPaint.ColorTransform,
+    dst_color_type: types.ColorType,
 ) SmPaint {
     return switch (shader) {
         .solid => |c| .{
             // Fold order matches the blitter's per-pixel order: color
             // transform first, then the alpha modulator. Emit identity
             // cxform so the folded color is never transformed again.
+            // The solid color stays LOGICAL RGBA — `resolveSolid` does the
+            // late lane fold per `dst_color_type`.
             .shader = .{ .solid = applyAlphaModulation(
                 if (cxform.isIdentity()) c else cxform.apply(c),
                 alpha,
@@ -731,6 +734,7 @@ inline fn paintFromShader(
             .stroke_width = stroke_width,
             .blend_mode = blend_mode,
             .global_alpha = 0xFF,
+            .dst_color_type = dst_color_type,
         },
         .gradient, .pattern => .{
             .shader = shader,
@@ -739,6 +743,7 @@ inline fn paintFromShader(
             .blend_mode = blend_mode,
             .global_alpha = alpha,
             .cxform = cxform,
+            .dst_color_type = dst_color_type,
         },
     };
 }
@@ -789,7 +794,7 @@ inline fn endCompositeLayer(self: *SmCanvas, layer: ?CompositeLayer) void {
     const l = layer orelse return;
     // Scratch (current self.pixels) is the rendered shape on a transparent
     // background; composite it onto the real canvas using the user's mode.
-    SmBlitter.blitFull(l.real_pixels, self.pixels, l.real_blend);
+    SmBlitter.blitFull(l.real_pixels, self.pixels, l.real_blend, self.surface.color_type);
     self.pixels = l.real_pixels;
     self.blendMode = l.real_blend;
 }
@@ -896,6 +901,7 @@ inline fn endShadowLayer(self: *SmCanvas, layer: ?ShadowLayer) void {
         .blend_mode = l.real_blend,
         .global_alpha = 0xFF,
         .stroke_width = 0,
+        .dst_color_type = self.surface.color_type,
     };
 
     const cw_i: i32 = @intCast(w);
@@ -938,7 +944,7 @@ inline fn endShadowLayer(self: *SmCanvas, layer: ?ShadowLayer) void {
     // so its premultiplied alpha is intact — `blitFull` runs the per-mode
     // blend formula per pixel against the destination (which now has the
     // shadow on top).
-    SmBlitter.blitFull(l.real_pixels, self.pixels, l.real_blend);
+    SmBlitter.blitFull(l.real_pixels, self.pixels, l.real_blend, self.surface.color_type);
 
     self.pixels = l.real_pixels;
     self.blendMode = l.real_blend;
@@ -1051,7 +1057,7 @@ inline fn endFilterLayer(self: *SmCanvas, layer: ?FilterLayer) void {
     // Composite the filtered scratch onto the real canvas using the user's
     // blend mode. globalAlpha was pre-modulated into the source at draw
     // time, so no additional alpha pass is needed here.
-    SmBlitter.blitFull(l.real_pixels, self.pixels, l.real_blend);
+    SmBlitter.blitFull(l.real_pixels, self.pixels, l.real_blend, self.surface.color_type);
 
     self.pixels = l.real_pixels;
     self.blendMode = l.real_blend;
@@ -1697,7 +1703,7 @@ fn strokeInternal(self: *SmCanvas, path: *const SmPath) void {
     defer self.endCompositeLayer(layer);
     // strokePath takes a fill-shaped paint (it inflates the outline polygon
     // and fills it through the same scan pipeline as fillPath).
-    var paint = paintFromShader(self.strokeStyle, .fill, 0, self.alpha, self.blendMode, self.cxform);
+    var paint = paintFromShader(self.strokeStyle, .fill, 0, self.alpha, self.blendMode, self.cxform, self.surface.color_type);
     const clip_mask: ?[]const u8 = if (self.clip_mask) |m| m else null;
     const aa = self.ensureAaScratch() orelse return;
     SmScan.strokePath(
@@ -1782,7 +1788,8 @@ fn clipInternal(self: *SmCanvas, path: *const SmPath, fill_rule: SmScan.FillRule
 pub fn clearRect(self: *SmCanvas, x: f64, y: f64, w: f64, h: f64) void {
     // clearRect bypasses globalAlpha and blend mode per HTML5 spec —
     // it always writes transparent black with `src` (overwrite).
-    const p: SmPaint = .{ .shader = .{ .solid = 0 }, .style = .fill, .blend_mode = .src };
+    // (Transparent black is order-invariant; dst_color_type set for form.)
+    const p: SmPaint = .{ .shader = .{ .solid = 0 }, .style = .fill, .blend_mode = .src, .dst_color_type = self.surface.color_type };
     self.drawRect(x, y, w, h, &p);
 }
 
@@ -1851,7 +1858,7 @@ pub fn strokeTriangle(
     path.closePath();
     // strokePath takes a fill-shaped paint (it inflates the outline polygon
     // and fills it through the same scan pipeline as fillPath).
-    var paint = paintFromShader(self.strokeStyle, .fill, 0, self.alpha, self.blendMode, self.cxform);
+    var paint = paintFromShader(self.strokeStyle, .fill, 0, self.alpha, self.blendMode, self.cxform, self.surface.color_type);
     const aa = self.ensureAaScratch() orelse return;
     const clip_mask: ?[]const u8 = if (self.clip_mask) |m| m else null;
     SmScan.strokePath(
@@ -1883,7 +1890,7 @@ pub fn getImageData(
     sw: i32,
     sh: i32,
 ) GetImageDataError!SmBitmap {
-    return SmBitmap.fromSurfacePixels(self.surface.getAllocator(), self.pixels, self.surface.width, self.surface.height, sx, sy, sw, sh, .{});
+    return SmBitmap.fromSurfacePixelsOrdered(self.surface.getAllocator(), self.pixels, self.surface.width, self.surface.height, sx, sy, sw, sh, .{}, self.surface.color_type);
 }
 
 /// getImageData(sx, sy, sw, sh, settings) — settings form.
@@ -1901,7 +1908,7 @@ pub fn getImageDataSettings(
     sh: i32,
     settings: types.BitmapSettings,
 ) GetImageDataError!SmBitmap {
-    return SmBitmap.fromSurfacePixels(self.surface.getAllocator(), self.pixels, self.surface.width, self.surface.height, sx, sy, sw, sh, settings);
+    return SmBitmap.fromSurfacePixelsOrdered(self.surface.getAllocator(), self.pixels, self.surface.width, self.surface.height, sx, sy, sw, sh, settings, self.surface.color_type);
 }
 
 // --- drawImage family (Skia drawImage / drawImageRect) -------------------
@@ -2053,6 +2060,7 @@ pub fn drawImageScaledSub(
         .blend_mode = self.blendMode,
         .global_alpha = self.alpha,
         .cxform = self.cxform, // tints sampled image rows per pixel
+        .dst_color_type = self.surface.color_type,
     };
 
     var py: i32 = dst_y0_i;
@@ -2213,7 +2221,11 @@ pub fn writePixelsDirty(
         const dst_col: usize = @intCast(dst_x0);
         const src_slice = (src_pixels + src_row_idx * src_stride + src_col)[0..copy_w];
         const dst_slice = self.pixels[dst_row_idx * dst_stride + dst_col ..][0..copy_w];
-        simd.copyU32(dst_slice, src_slice);
+        switch (self.surface.color_type) {
+            // Bitmap bytes are RGBA (WHATWG); fold into surface order.
+            .rgba8888 => simd.copyU32(dst_slice, src_slice),
+            .bgra8888 => simd.swizzleRBCopyU32(dst_slice, src_slice),
+        }
     }
 }
 

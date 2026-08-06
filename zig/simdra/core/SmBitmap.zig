@@ -767,6 +767,24 @@ pub fn fromSurfacePixels(
     sh: i32,
     settings: types.BitmapSettings,
 ) FromSurfaceError!SmBitmap {
+    return fromSurfacePixelsOrdered(allocator, surface_pixels, surface_w, surface_h, sx, sy, sw, sh, settings, .rgba8888);
+}
+
+/// Variant carrying the SOURCE surface's byte order. Bitmaps / ImageData
+/// are always RGBA (WHATWG), so `.bgra8888` sources are lane-folded during
+/// the copy. Additive — the original arity stays binding-frozen.
+pub fn fromSurfacePixelsOrdered(
+    allocator: std.mem.Allocator,
+    surface_pixels: []const u32,
+    surface_w: u32,
+    surface_h: u32,
+    sx: i32,
+    sy: i32,
+    sw: i32,
+    sh: i32,
+    settings: types.BitmapSettings,
+    src_order: types.ColorType,
+) FromSurfaceError!SmBitmap {
     if (sw == 0 or sh == 0) return error.IndexSize;
 
     const abs_w: u32 = @intCast(if (sw < 0) -sw else sw);
@@ -801,14 +819,31 @@ pub fn fromSurfacePixels(
                 .rgba_unorm8 => {
                     const dst_u32: [*]u32 = @ptrCast(@alignCast(data.ptr));
                     const dst_slice = (dst_u32 + dst_row * abs_w + dst_col)[0..copy_w];
-                    simd.copyU32(dst_slice, src_slice);
+                    switch (src_order) {
+                        .rgba8888 => simd.copyU32(dst_slice, src_slice),
+                        .bgra8888 => simd.swizzleRBCopyU32(dst_slice, src_slice),
+                    }
                 },
                 .rgba_float16 => {
                     const dst_f16: [*]f16 = @ptrCast(@alignCast(data.ptr));
                     const dst_components_per_row: usize = @as(usize, abs_w) * 4;
                     const dst_offset = dst_row * dst_components_per_row + dst_col * 4;
                     const dst_slice = (dst_f16 + dst_offset)[0 .. copy_w * 4];
-                    simd.copyU32ToFloat16Norm(dst_slice, src_slice);
+                    switch (src_order) {
+                        .rgba8888 => simd.copyU32ToFloat16Norm(dst_slice, src_slice),
+                        .bgra8888 => {
+                            // Chunked swizzle → convert. Float16 readback of
+                            // BGRA surfaces is rare; a stack scratch is fine.
+                            var tmp: [64]u32 = undefined;
+                            var off: usize = 0;
+                            while (off < copy_w) {
+                                const n = @min(tmp.len, copy_w - off);
+                                simd.swizzleRBCopyU32(tmp[0..n], src_slice[off..][0..n]);
+                                simd.copyU32ToFloat16Norm(dst_slice[off * 4 ..][0 .. n * 4], tmp[0..n]);
+                                off += n;
+                            }
+                        },
+                    }
                 },
             }
         }

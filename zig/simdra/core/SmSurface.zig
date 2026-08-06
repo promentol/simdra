@@ -37,6 +37,12 @@ pixels: []u32,
 width: u32,
 height: u32,
 colorSpace: types.ColorSpace = .srgb,
+/// Surface byte order (SkColorType analog). `pixels` are ALWAYS stored in
+/// this order; the blitter swizzles source colors at resolution time and
+/// the ImageData / encoder boundaries convert back to RGBA. The HTML5
+/// facade always creates `.rgba8888` surfaces — `.bgra8888` is the
+/// zero-copy libretro XRGB8888 path (Flash renderer).
+color_type: types.ColorType = .rgba8888,
 ctx_ptr: ?*SmCanvas = null,
 /// Most recent encoded payload (PNG or JPEG bytes). One slot — encoding
 /// in either format invalidates the previous. JS holds copies (the
@@ -74,6 +80,20 @@ pub fn init(allocator: std.mem.Allocator, width: u32, height: u32) !SmSurface {
 /// `src/index.ts` calls `SmSurface.initDefault(w, h)`.
 pub fn initDefault(width: u32, height: u32) !SmSurface {
     return init(std.heap.page_allocator, width, height);
+}
+
+/// initWithColorType(allocator, w, h, ct) — explicit-allocator factory with
+/// a surface byte order. Additive variant (existing factory arities are
+/// binding-frozen).
+pub fn initWithColorType(
+    allocator: std.mem.Allocator,
+    width: u32,
+    height: u32,
+    ct: types.ColorType,
+) !SmSurface {
+    var s = try init(allocator, width, height);
+    s.color_type = ct;
+    return s;
 }
 
 /// resize(new_w, new_h) — HTML5 spec: assigning to canvas.width/.height
@@ -144,10 +164,23 @@ pub fn encodePng(self: *SmSurface) ![]const u8 {
         return empty;
     }
 
-    const rgba: []const u8 = std.mem.sliceAsBytes(self.pixels);
+    var scratch: ?[]u32 = null;
+    defer if (scratch) |s| allocator.free(s);
+    const rgba: []const u8 = try self.pixelsAsRgbaBytes(allocator, &scratch);
     const bytes = try encoder.encodePng(allocator, rgba, self.width, self.height);
     self.last_encoded = bytes;
     return bytes;
+}
+
+/// Encoders consume RGBA byte order. For `.rgba8888` this is the pixel
+/// buffer as-is (zero copy); for `.bgra8888` a swizzled copy is produced
+/// into `*scratch` (caller frees).
+fn pixelsAsRgbaBytes(self: *const SmSurface, allocator: std.mem.Allocator, scratch: *?[]u32) ![]const u8 {
+    if (self.color_type == .rgba8888) return std.mem.sliceAsBytes(self.pixels);
+    const copy = try allocator.alloc(u32, self.pixels.len);
+    simd.swizzleRBCopyU32(copy, self.pixels);
+    scratch.* = copy;
+    return std.mem.sliceAsBytes(copy);
 }
 
 // encodeJpeg(quality) — encode the surface's pixel buffer as a JPEG.
@@ -166,7 +199,9 @@ pub fn encodeJpeg(self: *SmSurface, quality: u8) ![]const u8 {
         return empty;
     }
 
-    const rgba: []const u8 = std.mem.sliceAsBytes(self.pixels);
+    var scratch: ?[]u32 = null;
+    defer if (scratch) |s| allocator.free(s);
+    const rgba: []const u8 = try self.pixelsAsRgbaBytes(allocator, &scratch);
     const bytes = try encoder.encodeJpeg(allocator, rgba, self.width, self.height, quality);
     self.last_encoded = bytes;
     return bytes;

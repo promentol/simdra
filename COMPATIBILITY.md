@@ -55,6 +55,10 @@ each spec file under `specs/`; this is a flat, scannable rollup.
 | `Canvas.toBytes(type?, quality?)` | Same dispatch as `toDataURL` but skips the base64 round-trip. `type` defaults to `'image/png'`; `'image/jpeg'` accepts an optional `quality` in HTML5 0.0–1.0. |
 | `Image` (`Image.fromBytes(bytes)`) | Decoded image source for `drawImage` / `createPattern`. Backed by stb_image (PNG / JPEG / BMP / GIF first frame). Browser-shaped helper but not the spec's HTMLImageElement (no `src` / `onload`; bytes go in synchronously). |
 | `microsharp` named export (`import { microsharp } from 'simdra'`) | Sharp-shaped fluent image-processing surface on the same Zig core. Accepts `Uint8Array` / `ArrayBuffer` / `Blob` / `ReadableStream<Uint8Array>` / `Response` (Workers idiom: `microsharp(req.body).jpeg(0.8).toBuffer()`). v0 ships decode / encode round-trip + `metadata()`; `resize()` / `rotate()` / etc. are stubs throwing `not implemented`. |
+| `CanvasGradient.setSpread('pad'\|'repeat'\|'reflect')` | Spread mode for the gradient parameter t outside [0, 1] (SVG `spreadMethod` / Skia `SkTileMode`). HTML5 is pad-only; default unchanged. Unknown values silently ignored. |
+| Pattern bilinear filtering (Zig API) | `SmPattern.setFilter(bilinear)` — wrap-aware premul 4-tap sampling for the Flash renderer's "smoothed" bitmap fills. The HTML5 facade stays nearest (published behavior); a JS setter would be an additive follow-up. |
+| Per-paint color transform (Zig API) | `SmPaint.ColorTransform` (SWF CXFORM shape: per-channel 8.8-fixed mult + add incl. alpha) + `SmCanvas.setColorTransform`. Applied post-shader/pre-blend; saved/restored with the state stack. No HTML5 surface. |
+| Surface color types (Zig API) | `SmSurface.initWithColorType(..., bgra8888)` — SkColorType-style surface byte order (memory B,G,R,A = little-endian XRGB8888, zero-copy libretro present). JS-created surfaces are always rgba8888; ImageData/toDataURL stay RGBA per WHATWG regardless. |
 
 ---
 

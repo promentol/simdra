@@ -25,6 +25,7 @@
 
 const std = @import("std");
 const simd = @import("../opts/simd.zig");
+const types = @import("types.zig");
 const SmPaint = @import("SmPaint.zig");
 
 /// blitRow — write `n` pixels starting at `(x_start, y)` per `paint`,
@@ -111,7 +112,7 @@ pub fn blitRow(
             @memcpy(eff, cr);
         }
         const solid_color = resolveSolid(paint);
-        dispatchCoverage(row, solid_color, eff, paint.blend_mode);
+        dispatchCoverage(row, solid_color, eff, paint.blend_mode, paint.dst_color_type);
         return;
     }
 
@@ -124,10 +125,10 @@ pub fn blitRow(
         // visually correct output across every HTML5 composite operator.
         // `src_over` / `src` / `copy` keep the optimized fast path.
         const solid_color = resolveSolid(paint);
-        dispatchCoverage(row, solid_color, cov, paint.blend_mode);
+        dispatchCoverage(row, solid_color, cov, paint.blend_mode, paint.dst_color_type);
         return;
     }
-    dispatchSolid(row, paint);
+    dispatchSolid(row, paint, paint.dst_color_type);
 }
 
 /// Per-pixel sampler path for `.gradient` / `.pattern` shaders. Walks the
@@ -162,6 +163,12 @@ inline fn dispatchShader(
         if (!paint.cxform.isIdentity()) {
             src = paint.cxform.apply(src);
         }
+        // Samplers emit logical RGBA; fold to surface order for BGRA
+        // destinations (alpha stays in lane 24-31, so ordering vs the
+        // alpha modulators below is irrelevant).
+        if (paint.dst_color_type == .bgra8888) {
+            src = simd.swizzleRB(src);
+        }
         // Fold paint.global_alpha into the source alpha (premul-aware via
         // simple 8-bit multiply — the rest of the pipeline uses straight
         // alpha; the per-mode kernel handles its own premul math).
@@ -182,7 +189,9 @@ inline fn dispatchShader(
             .style = paint.style,
             .blend_mode = paint.blend_mode,
         };
-        dispatchSolid(slot[0..1], &single);
+        // `single` keeps default dst_color_type/cxform (src is already in
+        // surface order) — the kernel choice travels via the ct parameter.
+        dispatchSolid(slot[0..1], &single, paint.dst_color_type);
         row[i] = slot[0];
     }
 }
@@ -193,7 +202,24 @@ inline fn modulateAlpha(rgba: u32, modulator: u8) u32 {
     return (rgba & 0x00FFFFFF) | (new_a << 24);
 }
 
-inline fn dispatchCoverage(row: []u32, solid_color: u32, cov: []const u8, mode: SmPaint.BlendMode) void {
+inline fn dispatchCoverage(
+    row: []u32,
+    solid_color: u32,
+    cov: []const u8,
+    mode: SmPaint.BlendMode,
+    ct: types.ColorType,
+) void {
+    // Only the four lum-asymmetric non-separable modes care about the
+    // surface byte order; every other kernel is R/G/B-symmetric.
+    if (ct == .bgra8888) {
+        switch (mode) {
+            .hue => return simd.blendHueCovBgraU32(row, solid_color, cov),
+            .saturation => return simd.blendSaturationCovBgraU32(row, solid_color, cov),
+            .color => return simd.blendColorCovBgraU32(row, solid_color, cov),
+            .luminosity => return simd.blendLuminosityCovBgraU32(row, solid_color, cov),
+            else => {},
+        }
+    }
     switch (mode) {
         .src, .src_over, .copy => simd.blendSrcOverCovU32(row, solid_color, cov),
         // Porter-Duff family.
@@ -244,9 +270,12 @@ inline fn solidColorOf(shader: SmPaint.Shader) u32 {
 /// default-initialized transform state, so colors that were already
 /// resolved per-pixel are not transformed a second time.
 pub inline fn resolveSolid(paint: *const SmPaint) u32 {
-    const c = solidColorOf(paint.shader);
-    if (paint.cxform.isIdentity()) return c;
-    return paint.cxform.apply(c);
+    var c = solidColorOf(paint.shader);
+    if (!paint.cxform.isIdentity()) c = paint.cxform.apply(c);
+    // Late lane fold: paint colors are logical RGBA; BGRA destinations get
+    // the R↔B swap here, after the (logical-channel) color transform.
+    if (paint.dst_color_type == .bgra8888) c = simd.swizzleRB(c);
+    return c;
 }
 
 /// blitRowFromSource — write a row of per-pixel source colors onto `dst`
@@ -275,6 +304,10 @@ pub fn blitRowFromSource(
         if (!paint.cxform.isIdentity()) {
             s = paint.cxform.apply(s);
         }
+        // Sampled bitmap rows are logical RGBA; fold for BGRA destinations.
+        if (paint.dst_color_type == .bgra8888) {
+            s = simd.swizzleRB(s);
+        }
         if (paint.global_alpha != 0xFF) {
             s = modulateAlpha(s, paint.global_alpha);
         }
@@ -289,7 +322,7 @@ pub fn blitRowFromSource(
             .style = paint.style,
             .blend_mode = paint.blend_mode,
         };
-        dispatchSolid(slot[0..1], &single);
+        dispatchSolid(slot[0..1], &single, paint.dst_color_type);
         dst[i] = slot[0];
     }
 }
@@ -301,16 +334,18 @@ pub fn blitRowFromSource(
 /// non-row-friendly modes (src-in / src-out / dst-in / dst-atop / copy)
 /// whose pixel formula yields a non-`dst` result outside the shape's
 /// affected region — those modes need to see every canvas pixel.
-pub fn blitFull(dst: []u32, src: []const u32, mode: SmPaint.BlendMode) void {
+pub fn blitFull(dst: []u32, src: []const u32, mode: SmPaint.BlendMode, ct: types.ColorType) void {
     std.debug.assert(dst.len == src.len);
     // For each pixel, build a one-pixel "paint" and dispatch the same blend
-    // logic the row blitter uses. Avoids duplicating per-mode code.
+    // logic the row blitter uses. Avoids duplicating per-mode code. Both
+    // buffers are already in surface order (`ct` selects the lum-aware
+    // non-separable kernels; no source swizzling happens here).
     var i: usize = 0;
     while (i < dst.len) : (i += 1) {
         const single_src = src[i];
         var single_dst = [_]u32{dst[i]};
         const paint: SmPaint = .{ .shader = .{ .solid = single_src }, .style = .fill, .blend_mode = mode };
-        dispatchSolid(single_dst[0..1], &paint);
+        dispatchSolid(single_dst[0..1], &paint, ct);
         dst[i] = single_dst[0];
     }
 }
@@ -372,8 +407,110 @@ test "blitRowFromSource applies cxform to sampled rows (drawImage tint)" {
     try std.testing.expectEqual(@as(u32, 100 | (164 << 8) | (50 << 16) | (255 << 24)), dst[0]);
 }
 
-inline fn dispatchSolid(row: []u32, paint: *const SmPaint) void {
+test "swizzleRBCopyU32 kernel matches scalar on vector body + tail" {
+    var src: [37]u32 = undefined;
+    for (&src, 0..) |*p, i| p.* = @as(u32, @truncate(i *% 0x01020304)) ^ 0xA5C3;
+    var dst: [37]u32 = undefined;
+    simd.swizzleRBCopyU32(&dst, &src);
+    for (src, dst) |s, d| try std.testing.expectEqual(simd.swizzleRB(s), d);
+    try std.testing.expectEqual(@as(u32, 0x80CC9944), simd.swizzleRB(0x804499CC));
+}
+
+test "bgra output is the exact R/B swap of rgba output — all blend modes" {
+    const dst_init = [4]u32{ 0xFF204060, 0x80A0FF10, 0x00000000, 0x33112233 };
+    const cov = [4]u8{ 255, 128, 7, 0 };
+    const src_color: u32 = 0x99CC5522; // partial alpha, distinct R/B
+
+    inline for (@typeInfo(SmPaint.BlendMode).@"enum".fields) |f| {
+        const mode: SmPaint.BlendMode = @enumFromInt(f.value);
+        var p_rgba: SmPaint = .{ .shader = .{ .solid = src_color }, .blend_mode = mode };
+        var p_bgra = p_rgba;
+        p_bgra.dst_color_type = .bgra8888;
+
+        // Full-coverage path.
+        var a = dst_init;
+        var b: [4]u32 = undefined;
+        for (dst_init, 0..) |c, i| b[i] = simd.swizzleRB(c);
+        blitRow(&a, 4, 0, 0, 4, null, &p_rgba, null);
+        blitRow(&b, 4, 0, 0, 4, null, &p_bgra, null);
+        for (a, b) |x, y| try std.testing.expectEqual(simd.swizzleRB(x), y);
+
+        // Coverage path.
+        a = dst_init;
+        for (dst_init, 0..) |c, i| b[i] = simd.swizzleRB(c);
+        blitRow(&a, 4, 0, 0, 4, &cov, &p_rgba, null);
+        blitRow(&b, 4, 0, 0, 4, &cov, &p_bgra, null);
+        for (a, b) |x, y| try std.testing.expectEqual(simd.swizzleRB(x), y);
+
+        // blitFull path (both buffers already in surface order).
+        a = dst_init;
+        for (dst_init, 0..) |c, i| b[i] = simd.swizzleRB(c);
+        const full_src = [4]u32{ src_color, 0x10FF0080, 0xFF012345, 0x7F654321 };
+        var full_src_b: [4]u32 = undefined;
+        for (full_src, 0..) |c, i| full_src_b[i] = simd.swizzleRB(c);
+        blitFull(&a, &full_src, mode, .rgba8888);
+        blitFull(&b, &full_src_b, mode, .bgra8888);
+        for (a, b) |x, y| try std.testing.expectEqual(simd.swizzleRB(x), y);
+    }
+}
+
+test "bgra swap property holds for gradient and pattern shaders + cxform" {
+    const SmGradient = @import("../effects/SmGradient.zig");
+    const SmPattern = @import("../effects/SmPattern.zig");
+    const ta = std.testing.allocator;
+
+    var g = SmGradient.linearWithAllocator(ta, 0, 0, 4, 0);
+    defer g.deinit();
+    try g.addColorStop(0.0, "rgba(255, 32, 8, 0.8)");
+    try g.addColorStop(1.0, "#0040ff");
+    g.setSpread(.reflect);
+
+    const tile = [8]u8{ 250, 60, 10, 255, 20, 90, 200, 128 };
+    var pat = try SmPattern.createWithAllocator(ta, &tile, 2, 1, .repeat);
+    defer pat.deinit();
+    pat.setFilter(.bilinear);
+
+    const cx: SmPaint.ColorTransform = .{ .mult = .{ 200, 256, 300, 256 }, .add = .{ 10, -20, 0, 5 } };
+    const dst_init = [4]u32{ 0xFF204060, 0x80A0FF10, 0x00000000, 0x33112233 };
+    const shaders = [2]SmPaint.Shader{ .{ .gradient = &g }, .{ .pattern = &pat } };
+
+    for (shaders) |shader| {
+        var p_rgba: SmPaint = .{ .shader = shader, .blend_mode = .src_over, .cxform = cx, .global_alpha = 200 };
+        var p_bgra = p_rgba;
+        p_bgra.dst_color_type = .bgra8888;
+        var a = dst_init;
+        var b: [4]u32 = undefined;
+        for (dst_init, 0..) |c, i| b[i] = simd.swizzleRB(c);
+        blitRow(&a, 4, 0, 0, 4, null, &p_rgba, null);
+        blitRow(&b, 4, 0, 0, 4, null, &p_bgra, null);
+        for (a, b) |x, y| try std.testing.expectEqual(simd.swizzleRB(x), y);
+    }
+
+    // drawImage row path (sampled RGBA source rows).
+    const src_row = [4]u32{ 0x99CC5522, 0x10FF0080, 0xFF012345, 0x7F654321 };
+    var p_rgba: SmPaint = .{ .shader = .{ .solid = 0 }, .blend_mode = .src_over, .cxform = cx, .global_alpha = 200 };
+    var p_bgra = p_rgba;
+    p_bgra.dst_color_type = .bgra8888;
+    var a = dst_init;
+    var b: [4]u32 = undefined;
+    for (dst_init, 0..) |c, i| b[i] = simd.swizzleRB(c);
+    blitRowFromSource(&a, &src_row, &p_rgba, null);
+    blitRowFromSource(&b, &src_row, &p_bgra, null);
+    for (a, b) |x, y| try std.testing.expectEqual(simd.swizzleRB(x), y);
+}
+
+inline fn dispatchSolid(row: []u32, paint: *const SmPaint, ct: types.ColorType) void {
     const solid = resolveSolid(paint);
+    // See dispatchCoverage: only the non-separable modes branch on order.
+    if (ct == .bgra8888) {
+        switch (paint.blend_mode) {
+            .hue => return simd.blendHueBgraU32(row, solid),
+            .saturation => return simd.blendSaturationBgraU32(row, solid),
+            .color => return simd.blendColorBgraU32(row, solid),
+            .luminosity => return simd.blendLuminosityBgraU32(row, solid),
+            else => {},
+        }
+    }
     switch (paint.blend_mode) {
         // Internal — clearRect uses this directly.
         .src, .copy => simd.fillU32(row, solid),

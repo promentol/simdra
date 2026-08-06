@@ -137,6 +137,18 @@ pub const blendSaturationCovU32 = generic.blendSaturationCovU32;
 pub const blendColorCovU32 = generic.blendColorCovU32;
 pub const blendLuminosityCovU32 = generic.blendLuminosityCovU32;
 
+// BGRA-destination non-separable variants + R/B swizzle (color-type support).
+pub const blendHueBgraU32 = generic.blendHueBgraU32;
+pub const blendSaturationBgraU32 = generic.blendSaturationBgraU32;
+pub const blendColorBgraU32 = generic.blendColorBgraU32;
+pub const blendLuminosityBgraU32 = generic.blendLuminosityBgraU32;
+pub const blendHueCovBgraU32 = generic.blendHueCovBgraU32;
+pub const blendSaturationCovBgraU32 = generic.blendSaturationCovBgraU32;
+pub const blendColorCovBgraU32 = generic.blendColorCovBgraU32;
+pub const blendLuminosityCovBgraU32 = generic.blendLuminosityCovBgraU32;
+pub const swizzleRB = generic.swizzleRB;
+pub const swizzleRBCopyU32 = generic.swizzleRBCopyU32;
+
 pub const sampleImageNearestRow = generic.sampleImageNearestRow;
 pub const sampleImageBilinearRow = generic.sampleImageBilinearRow;
 pub const NearestSampleChunkPixels = generic.NearestSampleChunkPixels;

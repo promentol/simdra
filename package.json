@@ -33,6 +33,7 @@
     "test:sharp": "node --loader=node-zigar --no-warnings test/microsharp_compare.js",
     "test:leak": "cd zig && zig test leak_test.zig -lc -I . simdra/utils/stb_image.c simdra/utils/stb_truetype.c",
     "test:zig": "cd zig && zig test simdra/tests.zig",
+    "test:format": "cd zig && zig test format_test.zig -lc -I . simdra/utils/stb_image.c simdra/utils/stb_truetype.c",
     "test:visual": "npm run build && node --experimental-vm-modules ./node_modules/jest/bin/jest.js",
     "test:all": "npm run test && npm run test:visual",
     "bench": "npm run build && node --loader=node-zigar --no-warnings bench/run.js",

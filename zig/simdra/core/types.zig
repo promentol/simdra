@@ -11,6 +11,16 @@ pub const PixelFormat = enum {
     rgba_float16,
 };
 
+/// Surface byte order — the SkColorType analog, scoped to `SmSurface`
+/// (bitmaps / ImageData stay always-RGBA per WHATWG). `.bgra8888` swaps
+/// the R and B lanes: memory bytes B,G,R,A — which is little-endian
+/// `XRGB8888` when alpha is ignored, i.e. a zero-copy libretro present.
+/// Append-only; explicit tags cross the JS binding as integers.
+pub const ColorType = enum(u8) {
+    rgba8888 = 0,
+    bgra8888 = 1,
+};
+
 pub const BitmapSettings = struct {
     colorSpace: ColorSpace = .srgb,
     pixelFormat: PixelFormat = .rgba_unorm8,

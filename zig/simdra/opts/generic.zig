@@ -496,7 +496,42 @@ inline fn nonSepBlendChannels(comptime kind: NonSepKind, cb: RGB, cs: RGB) RGB {
     };
 }
 
-inline fn nonSepScalar(src: u32, dst: u32, comptime kind: NonSepKind) u32 {
+/// Swap the R and B bytes of a packed pixel (RGBA8888 ⇄ BGRA8888 lane
+/// permutation). G and A stay put in both layouts.
+pub inline fn swizzleRB(c: u32) u32 {
+    return (c & 0xFF00FF00) | ((c & 0x000000FF) << 16) | ((c >> 16) & 0x000000FF);
+}
+
+/// Bulk R↔B swizzle copy — the RGBA⇄BGRA boundary conversion kernel
+/// (encoders, getImageData/putImageData on BGRA surfaces). `dst` and `src`
+/// must be equal length; `dst == src` aliasing is fine (pure per-element).
+pub fn swizzleRBCopyU32(dst: []u32, src: []const u32) void {
+    std.debug.assert(dst.len == src.len);
+    const N = 16;
+    const V = @Vector(N, u32);
+    var i: usize = 0;
+    while (i + N <= src.len) : (i += N) {
+        const v: V = src[i..][0..N].*;
+        const out = (v & @as(V, @splat(0xFF00FF00))) |
+            ((v & @as(V, @splat(0x000000FF))) << @as(@Vector(N, u5), @splat(16))) |
+            ((v >> @as(@Vector(N, u5), @splat(16))) & @as(V, @splat(0x000000FF)));
+        dst[i..][0..N].* = out;
+    }
+    while (i < src.len) : (i += 1) dst[i] = swizzleRB(src[i]);
+}
+
+inline fn nonSepScalar(src: u32, dst: u32, comptime kind: NonSepKind, comptime swap_rb: bool) u32 {
+    if (swap_rb) {
+        // BGRA destination: fold both operands to logical RGBA so lum()'s
+        // (0.30, 0.59, 0.11) coefficients hit the right channels, then
+        // fold the result back to surface order. satRgb/setSat are
+        // permutation-invariant; only lum-dependent math cares.
+        return swizzleRB(nonSepScalarRgba(swizzleRB(src), swizzleRB(dst), kind));
+    }
+    return nonSepScalarRgba(src, dst, kind);
+}
+
+inline fn nonSepScalarRgba(src: u32, dst: u32, comptime kind: NonSepKind) u32 {
     const sa = channelA(src); const da = channelA(dst);
     const inv_sa: u32 = 255 - sa;
     const ao = @min(@as(u32, 255), sa + d255(da * inv_sa));
@@ -572,18 +607,25 @@ pub const blendSoftLightU32 = rowOfSep(bSoftLight);
 pub const blendDifferenceU32 = rowOfSep(bDifference);
 pub const blendExclusionU32 = rowOfSep(bExclusion);
 
-fn rowOfNonSep(comptime kind: NonSepKind) fn (dst: []u32, src_color: u32) void {
+fn rowOfNonSep(comptime kind: NonSepKind, comptime swap_rb: bool) fn (dst: []u32, src_color: u32) void {
     return struct {
         fn run(dst: []u32, src_color: u32) void {
-            for (dst) |*p| p.* = nonSepScalar(src_color, p.*, kind);
+            for (dst) |*p| p.* = nonSepScalar(src_color, p.*, kind, swap_rb);
         }
     }.run;
 }
 
-pub const blendHueU32 = rowOfNonSep(.hue);
-pub const blendSaturationU32 = rowOfNonSep(.saturation);
-pub const blendColorU32 = rowOfNonSep(.color);
-pub const blendLuminosityU32 = rowOfNonSep(.luminosity);
+pub const blendHueU32 = rowOfNonSep(.hue, false);
+pub const blendSaturationU32 = rowOfNonSep(.saturation, false);
+pub const blendColorU32 = rowOfNonSep(.color, false);
+pub const blendLuminosityU32 = rowOfNonSep(.luminosity, false);
+
+// BGRA-destination variants: identical math on logical channels, with the
+// R↔B lane fold. Only these four blend modes are channel-asymmetric (lum).
+pub const blendHueBgraU32 = rowOfNonSep(.hue, true);
+pub const blendSaturationBgraU32 = rowOfNonSep(.saturation, true);
+pub const blendColorBgraU32 = rowOfNonSep(.color, true);
+pub const blendLuminosityBgraU32 = rowOfNonSep(.luminosity, true);
 
 // ---- Coverage-aware row kernels ------------------------------------------
 //
@@ -616,12 +658,12 @@ fn rowOfCov(comptime k: BlendKernel) fn (dst: []u32, src_color: u32, cov: []cons
     }.run;
 }
 
-fn rowOfCovNonSep(comptime kind: NonSepKind) fn (dst: []u32, src_color: u32, cov: []const u8) void {
+fn rowOfCovNonSep(comptime kind: NonSepKind, comptime swap_rb: bool) fn (dst: []u32, src_color: u32, cov: []const u8) void {
     return struct {
         fn run(dst: []u32, src_color: u32, cov: []const u8) void {
             std.debug.assert(dst.len == cov.len);
             for (dst, cov) |*p, c| {
-                p.* = nonSepScalar(modulateAlphaByCov(src_color, c), p.*, kind);
+                p.* = nonSepScalar(modulateAlphaByCov(src_color, c), p.*, kind, swap_rb);
             }
         }
     }.run;
@@ -651,10 +693,14 @@ pub const blendDifferenceCovU32 = rowOfCov(sepKernel(bDifference));
 pub const blendExclusionCovU32 = rowOfCov(sepKernel(bExclusion));
 
 // Non-separable HSL coverage variants.
-pub const blendHueCovU32 = rowOfCovNonSep(.hue);
-pub const blendSaturationCovU32 = rowOfCovNonSep(.saturation);
-pub const blendColorCovU32 = rowOfCovNonSep(.color);
-pub const blendLuminosityCovU32 = rowOfCovNonSep(.luminosity);
+pub const blendHueCovU32 = rowOfCovNonSep(.hue, false);
+pub const blendSaturationCovU32 = rowOfCovNonSep(.saturation, false);
+pub const blendColorCovU32 = rowOfCovNonSep(.color, false);
+pub const blendLuminosityCovU32 = rowOfCovNonSep(.luminosity, false);
+pub const blendHueCovBgraU32 = rowOfCovNonSep(.hue, true);
+pub const blendSaturationCovBgraU32 = rowOfCovNonSep(.saturation, true);
+pub const blendColorCovBgraU32 = rowOfCovNonSep(.color, true);
+pub const blendLuminosityCovBgraU32 = rowOfCovNonSep(.luminosity, true);
 
 // `add` (HTML5 'lighter') uses saturating per-channel add. The non-coverage
 // kernel sums raw RGB without alpha-premultiplying; the coverage variant

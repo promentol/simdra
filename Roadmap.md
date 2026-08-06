@@ -4,6 +4,29 @@ Future work, ordered by what unlocks the most use cases. No dates —
 items land when somebody picks them up. Each entry names what it
 enables and what stands in the way.
 
+## Flash-renderer extensions — landed (2026-08)
+
+Four additions driven by the handyflash (SWF/AVM1) renderer, all additive
+and JS-compatible; see COMPATIBILITY.md "simdra extensions":
+
+- **Gradient spread modes** — `SmGradient.spread` pad/repeat/reflect folded
+  in `colorAt`; non-spec `CanvasGradient.setSpread` on the JS facade.
+- **Pattern bilinear filtering** — `SmPattern.setFilter(.bilinear)`,
+  wrap-aware premul 4-tap (promoted from the code-comment future-work note).
+- **Per-paint color transform** — `SmPaint.ColorTransform` (SWF CXFORM:
+  8.8-fixed mult + add per channel incl. alpha), folded eagerly for solids,
+  applied post-sample for gradient/pattern/drawImage.
+- **Surface color types** — `types.ColorType` {rgba8888, bgra8888} on
+  `SmSurface`; source colors lane-fold at the blitter funnels, the four
+  lum-asymmetric non-separable kernels have Bgra variants, and the
+  ImageData/encoder boundaries convert back to RGBA. bgra8888 was cheaper
+  than every format listed below (same 4 B/px, pure lane permutation).
+
+Follow-up (not started): **gradient ramp LUT** — a 256-entry per-gradient
+ramp cache would make spread + sampling O(1) per pixel, but quantizes `t`
+and risks the pixel-exact gradient assertions in test/index.js (published
+behavior). Needs a bench baseline first (bench/ has no gradient entry yet).
+
 ## Pixel format expansion
 
 Today: `rgba_unorm8` only. Every kernel rejects other formats with

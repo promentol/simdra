@@ -99,6 +99,17 @@ const _async_encoding = if (enable_async_encoding) struct {
     }
 
     pub const work_ns = struct {
+
+        /// Async twin of SmSurface.pixelsAsRgbaBytes — encoders consume
+        /// RGBA; BGRA surfaces get a swizzled scratch copy (caller frees).
+        fn surfaceRgbaBytes(surface: *SmSurface, allocator: std.mem.Allocator, scratch: *?[]u32) ![]const u8 {
+            if (surface.color_type == .rgba8888) return std.mem.sliceAsBytes(surface.pixels);
+            const copy = try allocator.alloc(u32, surface.pixels.len);
+            @import("simdra/opts/simd.zig").swizzleRBCopyU32(copy, surface.pixels);
+            scratch.* = copy;
+            return std.mem.sliceAsBytes(copy);
+        }
+
         pub fn doEncodePng(surface: *SmSurface) ![]const u8 {
             const allocator = std.heap.page_allocator;
             if (surface.width == 0 or surface.height == 0) {
@@ -106,7 +117,9 @@ const _async_encoding = if (enable_async_encoding) struct {
                 try trackOrFree(empty);
                 return empty;
             }
-            const rgba: []const u8 = std.mem.sliceAsBytes(surface.pixels);
+            var scratch: ?[]u32 = null;
+            defer if (scratch) |sc| allocator.free(sc);
+            const rgba: []const u8 = try surfaceRgbaBytes(surface, allocator, &scratch);
             const bytes = try encoder.encodePng(allocator, rgba, surface.width, surface.height);
             errdefer allocator.free(bytes);
             try trackOrFree(bytes);
@@ -120,7 +133,9 @@ const _async_encoding = if (enable_async_encoding) struct {
                 try trackOrFree(empty);
                 return empty;
             }
-            const rgba: []const u8 = std.mem.sliceAsBytes(surface.pixels);
+            var scratch: ?[]u32 = null;
+            defer if (scratch) |sc| allocator.free(sc);
+            const rgba: []const u8 = try surfaceRgbaBytes(surface, allocator, &scratch);
             const bytes = try encoder.encodeJpeg(allocator, rgba, surface.width, surface.height, quality);
             errdefer allocator.free(bytes);
             try trackOrFree(bytes);

@@ -17,6 +17,12 @@ const SmGradient = @This();
 
 pub const Kind = enum(u8) { linear = 0, radial = 1, conic = 2 };
 
+/// How the gradient parameter t behaves outside [0, 1]. HTML5 canvas is
+/// pad-only; `.repeat` / `.reflect` are simdra extensions (Skia's
+/// `SkTileMode` / SVG `spreadMethod`), used by the Flash (SWF) renderer.
+/// Append-only — values cross the JS binding as integers.
+pub const Spread = enum(u8) { pad = 0, repeat = 1, reflect = 2 };
+
 pub const Stop = struct {
     offset: f64,
     rgba: u32,
@@ -52,6 +58,9 @@ fn insertStopSorted(stops: *StopList, allocator: std.mem.Allocator, stop: Stop) 
 
 geometry: Geometry,
 stops: StopList = .{},
+/// Spread mode for t outside [0, 1]. Defaulted so every existing
+/// struct-literal construction (and the HTML5 facade) keeps pad behavior.
+spread: Spread = .pad,
 /// Allocator for stop list growth. JS-binding factories default to
 /// `page_allocator`; pure-Zig callers can use `linearWithAllocator` /
 /// `radialWithAllocator` or set `.allocator = ...` at struct-literal time.
@@ -111,6 +120,13 @@ pub fn conicWithAllocator(allocator: std.mem.Allocator, startAngle: f64, x: f64,
 
 pub fn deinit(self: *SmGradient) void {
     self.stops.deinit(self.allocator);
+}
+
+/// setSpread(mode) — select pad / repeat / reflect behavior for t outside
+/// [0, 1]. Setter (not a factory parameter) so the existing factory
+/// arities stay binding-compatible.
+pub fn setSpread(self: *SmGradient, mode: Spread) void {
+    self.spread = mode;
 }
 
 // addColorStop(offset, color) — MDN: insert a color stop at `offset` ∈ [0,1].
@@ -184,11 +200,21 @@ inline fn lerpRgbaPremul(lo: u32, hi: u32, t: f64) u32 {
     return r | (g << 8) | (b << 16) | (a << 24);
 }
 
-/// colorAt(t) — pad-mode lookup against the sorted stop list.
+/// colorAt(t) — spread-folded lookup against the sorted stop list.
 fn colorAt(self: *const SmGradient, t: f64) u32 {
     if (self.stops.len == 0) return 0;
     if (self.stops.len == 1) return self.stops.ptr[0].rgba;
-    const tc = std.math.clamp(t, 0.0, 1.0);
+    const tc = switch (self.spread) {
+        .pad => std.math.clamp(t, 0.0, 1.0),
+        // Fractional part; exact integers land on 0 (Skia repeat rule).
+        .repeat => t - @floor(t),
+        // Triangle wave with period 2: 0→1→0. @rem keeps the dividend's
+        // sign; @abs folds negatives onto the same wave.
+        .reflect => blk: {
+            const m = @abs(@rem(t, 2.0));
+            break :blk if (m > 1.0) 2.0 - m else m;
+        },
+    };
     var i: usize = 0;
     while (i < self.stops.len and self.stops.ptr[i].offset < tc) : (i += 1) {}
     if (i == 0) return self.stops.ptr[0].rgba;
@@ -268,4 +294,61 @@ pub fn sampleConic(self: *const SmGradient, x: f64, y: f64) u32 {
     angle = @mod(angle, two_pi);
     if (angle < 0) angle += two_pi;
     return self.colorAt(angle / two_pi);
+}
+
+// --- Tests ---------------------------------------------------------------
+
+fn testGradientBW(allocator: std.mem.Allocator) !SmGradient {
+    var g = linearWithAllocator(allocator, 0, 0, 1, 0);
+    try g.addColorStop(0.0, "black"); // 0xFF000000
+    try g.addColorStop(1.0, "white"); // 0xFFFFFFFF
+    return g;
+}
+
+fn gray(v: u32) u32 {
+    return v | (v << 8) | (v << 16) | 0xFF000000;
+}
+
+test "colorAt pad clamps outside [0,1]" {
+    var g = try testGradientBW(std.testing.allocator);
+    defer g.deinit();
+    try std.testing.expectEqual(gray(0), g.colorAt(-1.5));
+    try std.testing.expectEqual(gray(0), g.colorAt(-0.25));
+    try std.testing.expectEqual(gray(0), g.colorAt(0.0));
+    try std.testing.expectEqual(gray(128), g.colorAt(0.5));
+    try std.testing.expectEqual(gray(255), g.colorAt(1.0));
+    try std.testing.expectEqual(gray(255), g.colorAt(1.25));
+    try std.testing.expectEqual(gray(255), g.colorAt(2.0));
+}
+
+test "colorAt repeat wraps to the fractional part" {
+    var g = try testGradientBW(std.testing.allocator);
+    defer g.deinit();
+    g.setSpread(.repeat);
+    try std.testing.expectEqual(gray(128), g.colorAt(-1.5)); // frac 0.5
+    try std.testing.expectEqual(gray(0), g.colorAt(-1.0)); // exact int → 0
+    try std.testing.expectEqual(gray(191), g.colorAt(-0.25)); // frac 0.75
+    try std.testing.expectEqual(gray(128), g.colorAt(0.5));
+    try std.testing.expectEqual(gray(0), g.colorAt(1.0)); // exact int → 0
+    try std.testing.expectEqual(gray(64), g.colorAt(1.25)); // frac 0.25
+    try std.testing.expectEqual(gray(0), g.colorAt(2.0));
+}
+
+test "colorAt reflect mirrors on odd periods" {
+    var g = try testGradientBW(std.testing.allocator);
+    defer g.deinit();
+    g.setSpread(.reflect);
+    try std.testing.expectEqual(gray(128), g.colorAt(-1.5)); // |rem|=1.5 → 0.5
+    try std.testing.expectEqual(gray(255), g.colorAt(-1.0)); // |rem|=1 → 1
+    try std.testing.expectEqual(gray(64), g.colorAt(-0.25)); // |rem|=.25
+    try std.testing.expectEqual(gray(128), g.colorAt(0.5));
+    try std.testing.expectEqual(gray(255), g.colorAt(1.0));
+    try std.testing.expectEqual(gray(191), g.colorAt(1.25)); // 2-1.25=0.75
+    try std.testing.expectEqual(gray(0), g.colorAt(2.0)); // full period
+    try std.testing.expectEqual(gray(128), g.colorAt(2.5));
+}
+
+test "default spread is pad and factories stay 4/6-arg" {
+    const g = linear(0, 0, 10, 0);
+    try std.testing.expectEqual(Spread.pad, g.spread);
 }

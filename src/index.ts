@@ -496,7 +496,26 @@ export class CanvasGradient {
   addColorStop(offset: number, color: string): void {
     this[ZIG].addColorStop(offset, color);
   }
+
+  /**
+   * simdra extension (non-spec): spread mode for the gradient parameter t
+   * outside [0, 1]. HTML5 canvas is pad-only; `'repeat'` / `'reflect'`
+   * match SVG `spreadMethod` / Skia `SkTileMode`. Unknown values are
+   * silently ignored (same tolerance as invalid CSS colors).
+   */
+  setSpread(mode: 'pad' | 'repeat' | 'reflect'): void {
+    const v = SPREAD_TO_ENUM[mode];
+    if (v === undefined) return;
+    this[ZIG].setSpread(v);
+  }
 }
+
+/** Spread mode name → Zig `SmGradient.Spread` enum integer. */
+const SPREAD_TO_ENUM: { [k: string]: 0 | 1 | 2 } = {
+  'pad': 0,
+  'repeat': 1,
+  'reflect': 2,
+};
 
 // =============================================================================
 // HTML5: CanvasPattern

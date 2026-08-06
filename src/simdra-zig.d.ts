@@ -332,6 +332,11 @@ declare module '*.zig' {
     invertSelf(): SmMatrix;
   }
 
+  // Spread mode for the gradient parameter t outside [0, 1]. Enum integer
+  // matches Zig SmGradient.Spread: 0 = pad (HTML5 default), 1 = repeat,
+  // 2 = reflect.
+  export type SmGradientSpread = 0 | 1 | 2;
+
   // SmGradient — Skia: SkGradientShader. Construction via SmGradient.linear /
   // SmGradient.radial static factories.
   export interface SmGradient {
@@ -339,6 +344,7 @@ declare module '*.zig' {
     x0: number; y0: number; r0: number;
     x1: number; y1: number; r1: number;
     addColorStop(offset: number, color: string): void;
+    setSpread(mode: SmGradientSpread): void;
     deinit(): void;
   }
 

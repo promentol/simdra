@@ -1475,6 +1475,35 @@ function pixelEq(data, idx, r, g, b, a, tol = 2) {
     pixelEq(px, 49 * 4, 128, 128, 128, 255, 4));
 }
 {
+  // simdra extension (non-spec): CanvasGradient.setSpread. Gradient spans
+  // x ∈ [0, 25); pad (default) clamps beyond, repeat tiles with period 1,
+  // reflect mirrors alternate periods. Pixel x samples at t=(x+0.5)/25.
+  const mk = (spread) => {
+    const c = createCanvas(100, 1);
+    const ctx = c.getContext('2d');
+    const g = ctx.createLinearGradient(0, 0, 25, 0);
+    g.addColorStop(0, '#000000');
+    g.addColorStop(1, '#ffffff');
+    if (spread) g.setSpread(spread);
+    ctx.fillStyle = g;
+    ctx.fillRect(0, 0, 100, 1);
+    return ctx.getImageData(0, 0, 100, 1).data;
+  };
+  const pad = mk(null);
+  plain('CanvasGradient setSpread: default pad clamps past the end',
+    pixelEq(pad, 60 * 4, 255, 255, 255, 255));
+  const rep = mk('repeat');
+  // x=30 → t=1.22 → frac 0.22 → ≈56 gray; x=55 → t=2.22 → same tile phase.
+  plain('CanvasGradient setSpread: repeat tiles with period 1',
+    pixelEq(rep, 30 * 4, 56, 56, 56, 255, 4) &&
+    pixelEq(rep, 55 * 4, 56, 56, 56, 255, 4));
+  const ref = mk('reflect');
+  // x=30 → t=1.22 → mirrored 0.78 → ≈199; x=44 → t=1.78 → mirrored 0.22 → ≈56.
+  plain('CanvasGradient setSpread: reflect mirrors alternate periods',
+    pixelEq(ref, 30 * 4, 199, 199, 199, 255, 4) &&
+    pixelEq(ref, 44 * 4, 56, 56, 56, 255, 4));
+}
+{
   // Premultiplied lerp: stop (0, transparent red) → (1, opaque blue) at midpoint.
   // straight values: (255,0,0,0) and (0,0,255,255). Premul: (0,0,0,0) and
   // (0,0,255,255). At t=0.5: premul (0,0,128,128) → straight (0,0,255,128).

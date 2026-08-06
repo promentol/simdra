@@ -59,6 +59,9 @@ each spec file under `specs/`; this is a flat, scannable rollup.
 | Pattern bilinear filtering (Zig API) | `SmPattern.setFilter(bilinear)` — wrap-aware premul 4-tap sampling for the Flash renderer's "smoothed" bitmap fills. The HTML5 facade stays nearest (published behavior); a JS setter would be an additive follow-up. |
 | Per-paint color transform (Zig API) | `SmPaint.ColorTransform` (SWF CXFORM shape: per-channel 8.8-fixed mult + add incl. alpha) + `SmCanvas.setColorTransform`. Applied post-shader/pre-blend; saved/restored with the state stack. No HTML5 surface. |
 | Surface color types (Zig API) | `SmSurface.initWithColorType(..., bgra8888)` — SkColorType-style surface byte order (memory B,G,R,A = little-endian XRGB8888, zero-copy libretro present). JS-created surfaces are always rgba8888; ImageData/toDataURL stay RGBA per WHATWG regardless. |
+| Flash blend modes (Zig API) | `BlendMode.flash_{subtract,invert,alpha,erase}` — SWF PlaceObject3 modes with no HTML5 equivalent (straight-alpha formulas documented in opts/generic.zig). Never produced by the JS facade. `flash_alpha` routes through layer compositing. |
+| `colorMatrixU32` kernel (Zig API) | 4×5 color matrix on logical-RGBA rows (Flash ColorMatrixFilter layout, offsets in 0–255 units) — the filter-layer primitive missing next to the existing blur / convolution / shadow machinery. |
+| `SmGradient.setSampling(lut256)` (Zig API) | Opt-in 256-entry baked ramp for gradient-heavy content; indexes the spread-folded t, rebuilt on stop changes. Default stays `.exact` — published HTML5 gradient output is untouched. |
 
 ---
 

@@ -149,6 +149,18 @@ pub const BlendMode = enum(u8) {
     color = 25,
     luminosity = 26,
 
+    // Flash (SWF PlaceObject3) modes — simdra extensions with no HTML5
+    // equivalent; never produced by the JS facade (no
+    // globalCompositeOperation mapping). Straight-alpha formulas in
+    // opts/generic.zig §Flash blend modes. `flash_alpha` / `flash_erase`
+    // are masking ops that Flash only honors inside a cached parent
+    // layer; `flash_alpha` requires layer compositing here too (its
+    // formula zeroes dst alpha outside the source region).
+    flash_subtract = 27,
+    flash_invert = 28,
+    flash_alpha = 29,
+    flash_erase = 30,
+
     /// Modes whose pixel formula yields a non-`dst` result OUTSIDE the
     /// source region (i.e. when the source has zero alpha). For these the
     /// blitter's row-by-row pass through the affected bbox is insufficient
@@ -165,7 +177,9 @@ pub const BlendMode = enum(u8) {
     /// blit is fine. Source-over isn't here because Fb(0,αb)=1 → αo=αb.
     pub fn requiresLayerComposite(self: BlendMode) bool {
         return switch (self) {
-            .src_in, .src_out, .dst_in, .dst_atop, .copy => true,
+            // flash_alpha: out.a = da·sa, so sa=0 outside the source region
+            // yields alpha 0 ≠ dst — same class as src_in.
+            .src_in, .src_out, .dst_in, .dst_atop, .copy, .flash_alpha => true,
             else => false,
         };
     }

@@ -15,10 +15,27 @@
 // node-zigar loader. `npm run bench` wires this up.
 
 import { performance } from 'node:perf_hooks';
-import { createCanvas as wasmCreate } from '../dist/simdra.mjs';
 import { createCanvas as nativeCreate } from '../src/index.ts';
-import { createCanvas as skiaCreate } from '@napi-rs/canvas';
-import { createCanvas as cairoCreate } from 'canvas';
+
+// Optional legs — skip gracefully when not built/installed. The wasm leg
+// needs `npm run build` first (vite emits dist/wasm/index.mjs).
+async function tryImport(spec) {
+  try {
+    return await import(spec);
+  } catch {
+    return null;
+  }
+}
+const wasmMod = await tryImport('../dist/wasm/index.mjs');
+const skiaMod = await tryImport('@napi-rs/canvas');
+const cairoMod = await tryImport('canvas');
+
+const LEGS = [
+  wasmMod && ['simdra wasm  ', wasmMod.createCanvas],
+  ['simdra native', nativeCreate],
+  skiaMod && ['napi-skia    ', skiaMod.createCanvas],
+  cairoMod && ['node-canvas  ', cairoMod.createCanvas],
+].filter(Boolean);
 
 const W = 800;
 const H = 600;
@@ -40,12 +57,7 @@ function bench(label, fn, { warmup = 100, runs = 1000 } = {}) {
 function runSuite(name, makeWorkload, options) {
   console.log(`\n## ${name}`);
   console.log('─'.repeat(76));
-  const results = [
-    bench('simdra wasm  ', makeWorkload(wasmCreate), options),
-    bench('simdra native', makeWorkload(nativeCreate), options),
-    bench('napi-skia    ', makeWorkload(skiaCreate), options),
-    bench('node-canvas  ', makeWorkload(cairoCreate), options),
-  ];
+  const results = LEGS.map(([label, create]) => bench(label, makeWorkload(create), options));
   const slowest = Math.max(...results.map((r) => r.msPerOp));
   for (const r of results) {
     const speedup = slowest / r.msPerOp;
@@ -151,22 +163,73 @@ function putImageDataWorkload(create) {
   };
 }
 
+// Full-canvas linear gradient fill — exercises the per-pixel shader path
+// (SmGradient sampler + per-pixel blend dispatch). 1-px readback flush.
+function linearGradientWorkload(create) {
+  const canvas = create(W, H);
+  const ctx = canvas.getContext('2d');
+  const g = ctx.createLinearGradient(0, 0, W, 0);
+  g.addColorStop(0, '#ff0000');
+  g.addColorStop(0.5, '#00ff00');
+  g.addColorStop(1, '#0000ff');
+  return () => {
+    ctx.fillStyle = g;
+    ctx.fillRect(0, 0, W, H);
+    const id = ctx.getImageData(0, 0, 1, 1);
+    return id.data[0];
+  };
+}
+
+// Radial gradient — adds the per-pixel quadratic solve (sqrt) to the mix.
+function radialGradientWorkload(create) {
+  const canvas = create(W, H);
+  const ctx = canvas.getContext('2d');
+  const g = ctx.createRadialGradient(W / 2, H / 2, 0, W / 2, H / 2, 400);
+  g.addColorStop(0, '#ffffff');
+  g.addColorStop(1, '#000080');
+  return () => {
+    ctx.fillStyle = g;
+    ctx.fillRect(0, 0, W, H);
+    const id = ctx.getImageData(0, 0, 1, 1);
+    return id.data[0];
+  };
+}
+
+// Full-canvas pattern fill — per-pixel inverse-transform + texel fetch.
+function patternFillWorkload(create) {
+  const canvas = create(W, H);
+  const ctx = canvas.getContext('2d');
+  const tile = create(16, 16);
+  const tctx = tile.getContext('2d');
+  tctx.fillStyle = '#123456';
+  tctx.fillRect(0, 0, 16, 16);
+  tctx.fillStyle = '#abcdef';
+  tctx.fillRect(0, 0, 8, 8);
+  const pat = ctx.createPattern(tile, 'repeat');
+  return () => {
+    ctx.fillStyle = pat;
+    ctx.fillRect(0, 0, W, H);
+    const id = ctx.getImageData(0, 0, 1, 1);
+    return id.data[0];
+  };
+}
+
 // ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
 
 console.log(`\nsimdra benchmark — ${W}×${H} canvas`);
 console.log(`node ${process.version}, arch ${process.arch}, platform ${process.platform}\n`);
-console.log('Legs:');
-console.log('  simdra wasm   — dist/simdra.mjs (WASM SIMD via V8)');
-console.log('  simdra native — zig/simdra.zig via node-zigar loader (NEON aarch64)');
-console.log('  napi-skia     — @napi-rs/canvas (Skia, N-API native binding)');
-console.log('  node-canvas   — canvas (Cairo, node-gyp native binding)');
+console.log('Legs (missing ones skip gracefully):');
+for (const [label] of LEGS) console.log(`  ${label.trim()}`);
 
 runSuite('fillRect — full-canvas solid fill (deferred-friendly)', fillRectWorkload, { runs: 500 });
 runSuite('fillRect — full-canvas solid fill (forced flush via 1-px readback)', fillRectFlushedWorkload, { runs: 200 });
 runSuite('100 small fillRects — overhead test', manySmallRectsWorkload, { runs: 500 });
 runSuite('filled circle (path raster)', filledCircleWorkload, { runs: 200 });
+runSuite('linear gradient — full-canvas fill (per-pixel shader)', linearGradientWorkload, { warmup: 5, runs: 30 });
+runSuite('radial gradient — full-canvas fill (per-pixel quadratic)', radialGradientWorkload, { warmup: 5, runs: 30 });
+runSuite('pattern — full-canvas 16px tile fill', patternFillWorkload, { warmup: 5, runs: 30 });
 runSuite('getImageData — full canvas readback', getImageDataWorkload, { runs: 100 });
 runSuite('putImageData — full canvas write', putImageDataWorkload, { runs: 100 });
 

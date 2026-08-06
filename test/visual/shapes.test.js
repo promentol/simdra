@@ -7,7 +7,7 @@
 // Each test draws the SAME scene through HTML5-spec APIs in both
 // implementations, snapshots pixels, and asserts SSIM ≥ threshold.
 
-import { createCanvas as simdraCreate } from '../../dist/simdra.mjs';
+import { createCanvas as simdraCreate } from '../../dist/wasm/index.mjs';
 import { createCanvas as napiCreate } from '@napi-rs/canvas';
 import { compareSSIM } from './_helpers.js';
 

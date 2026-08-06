@@ -485,6 +485,89 @@ fn setSat(c: RGB, s: f64) RGB {
     return .{ .r = rs, .g = gs, .b = bs };
 }
 
+/// colorMatrixU32 — apply a 4×5 color matrix to a row of straight-alpha
+/// pixels in LOGICAL RGBA lane order (the Flash ColorMatrixFilter layout,
+/// row-major [r-row, g-row, b-row, a-row], each row = 4 channel weights +
+/// 1 offset in 0–255 units):
+///   out.c = clamp(m[c][0]·R + m[c][1]·G + m[c][2]·B + m[c][3]·A + m[c][4])
+/// This is the filter-layer primitive Flash's ColorMatrixFilter (and
+/// hue-rotate / saturate / sepia CSS filters) build on; blur, convolution,
+/// and shadow primitives already exist elsewhere in this module set.
+pub fn colorMatrixU32(row: []u32, m: *const [20]f32) void {
+    for (row) |*p| {
+        const c = p.*;
+        const in = [4]f32{
+            @floatFromInt(c & 0xFF),
+            @floatFromInt((c >> 8) & 0xFF),
+            @floatFromInt((c >> 16) & 0xFF),
+            @floatFromInt((c >> 24) & 0xFF),
+        };
+        var out: u32 = 0;
+        inline for (0..4) |ch| {
+            const base = ch * 5;
+            const v = m[base] * in[0] + m[base + 1] * in[1] +
+                m[base + 2] * in[2] + m[base + 3] * in[3] + m[base + 4];
+            const clamped: u32 = @intFromFloat(@round(std.math.clamp(v, 0.0, 255.0)));
+            out |= clamped << (8 * ch);
+        }
+        p.* = out;
+    }
+}
+
+// ---- Flash (SWF) blend modes ---------------------------------------------
+//
+// PlaceObject3 modes with no HTML5 / Porter-Duff equivalent. Straight-alpha
+// formulas matching Flash Player behavior (Ruffle's model):
+//   subtract: out.rgb = max(dst.rgb − src.rgb·sa, 0), out.a = da
+//   invert:   out.rgb = lerp(dst.rgb, 255 − dst.rgb, sa), out.a = da
+//   alpha:    out.rgb = dst.rgb, out.a = da·sa        (masking; needs layer)
+//   erase:    out.rgb = dst.rgb, out.a = da·(1 − sa)  (inverse masking)
+// All four are R/G/B-symmetric → no Bgra variants needed.
+
+fn flashSubtractScalar(src: u32, dst: u32) u32 {
+    const sa = channelA(src);
+    if (sa == 0) return dst;
+    var out: u32 = channelA(dst) << 24;
+    inline for (0..3) |i| {
+        const shift = 8 * i;
+        const s = (src >> shift) & 0xFF;
+        const d = (dst >> shift) & 0xFF;
+        const eff = (s * sa + 0x80) >> 8;
+        const v = if (d > eff) d - eff else 0;
+        out |= v << shift;
+    }
+    return out;
+}
+
+fn flashInvertScalar(src: u32, dst: u32) u32 {
+    const sa = channelA(src);
+    if (sa == 0) return dst;
+    var out: u32 = channelA(dst) << 24;
+    inline for (0..3) |i| {
+        const shift = 8 * i;
+        const d = (dst >> shift) & 0xFF;
+        const inv = 255 - d;
+        // lerp(d, inv, sa/255) with round-to-nearest.
+        const v = (d * (255 - sa) + inv * sa + 127) / 255;
+        out |= v << shift;
+    }
+    return out;
+}
+
+fn flashAlphaScalar(src: u32, dst: u32) u32 {
+    const sa = channelA(src);
+    const da = channelA(dst);
+    const a = (da * sa + 127) / 255;
+    return (dst & 0x00FFFFFF) | (a << 24);
+}
+
+fn flashEraseScalar(src: u32, dst: u32) u32 {
+    const sa = channelA(src);
+    const da = channelA(dst);
+    const a = (da * (255 - sa) + 127) / 255;
+    return (dst & 0x00FFFFFF) | (a << 24);
+}
+
 const NonSepKind = enum { hue, saturation, color, luminosity };
 
 inline fn nonSepBlendChannels(comptime kind: NonSepKind, cb: RGB, cs: RGB) RGB {
@@ -615,6 +698,11 @@ fn rowOfNonSep(comptime kind: NonSepKind, comptime swap_rb: bool) fn (dst: []u32
     }.run;
 }
 
+pub const blendFlashSubtractU32 = rowOf(flashSubtractScalar);
+pub const blendFlashInvertU32 = rowOf(flashInvertScalar);
+pub const blendFlashAlphaU32 = rowOf(flashAlphaScalar);
+pub const blendFlashEraseU32 = rowOf(flashEraseScalar);
+
 pub const blendHueU32 = rowOfNonSep(.hue, false);
 pub const blendSaturationU32 = rowOfNonSep(.saturation, false);
 pub const blendColorU32 = rowOfNonSep(.color, false);
@@ -693,6 +781,24 @@ pub const blendDifferenceCovU32 = rowOfCov(sepKernel(bDifference));
 pub const blendExclusionCovU32 = rowOfCov(sepKernel(bExclusion));
 
 // Non-separable HSL coverage variants.
+// Coverage wrapper over a plain scalar blend fn (coverage modulates the
+// source alpha, exactly like rowOfCov does for kernel-shaped blends).
+fn rowOfCovScalar(comptime scalar: fn (u32, u32) u32) fn (dst: []u32, src_color: u32, cov: []const u8) void {
+    return struct {
+        fn run(dst: []u32, src_color: u32, cov: []const u8) void {
+            std.debug.assert(dst.len == cov.len);
+            for (dst, cov) |*p, c| {
+                p.* = scalar(modulateAlphaByCov(src_color, c), p.*);
+            }
+        }
+    }.run;
+}
+
+pub const blendFlashSubtractCovU32 = rowOfCovScalar(flashSubtractScalar);
+pub const blendFlashInvertCovU32 = rowOfCovScalar(flashInvertScalar);
+pub const blendFlashAlphaCovU32 = rowOfCovScalar(flashAlphaScalar);
+pub const blendFlashEraseCovU32 = rowOfCovScalar(flashEraseScalar);
+
 pub const blendHueCovU32 = rowOfCovNonSep(.hue, false);
 pub const blendSaturationCovU32 = rowOfCovNonSep(.saturation, false);
 pub const blendColorCovU32 = rowOfCovNonSep(.color, false);
@@ -1163,4 +1269,41 @@ pub fn copyU32ToFloat16Norm(dst: []f16, src: []const u32) void {
         dst[base + 2] = @floatCast(@as(f32, @floatFromInt(b)) * inv_255);
         dst[base + 3] = @floatCast(@as(f32, @floatFromInt(a)) * inv_255);
     }
+}
+
+test "colorMatrixU32: identity, invert-with-offset, luma grayscale" {
+    const id: [20]f32 = .{
+        1, 0, 0, 0, 0,
+        0, 1, 0, 0, 0,
+        0, 0, 1, 0, 0,
+        0, 0, 0, 1, 0,
+    };
+    var row = [_]u32{ 0x80FF6420, 0x00000000, 0xFFFFFFFF };
+    const orig = row;
+    colorMatrixU32(&row, &id);
+    try std.testing.expectEqualSlices(u32, &orig, &row);
+
+    // RGB invert (alpha kept): out.c = −c + 255.
+    const inv: [20]f32 = .{
+        -1, 0,  0,  0, 255,
+        0,  -1, 0,  0, 255,
+        0,  0,  -1, 0, 255,
+        0,  0,  0,  1, 0,
+    };
+    var px = [_]u32{100 | (150 << 8) | (200 << 16) | (77 << 24)};
+    colorMatrixU32(&px, &inv);
+    try std.testing.expectEqual(@as(u32, 155 | (105 << 8) | (55 << 16) | (77 << 24)), px[0]);
+
+    // Rec.601 luma grayscale.
+    const lw = [3]f32{ 0.299, 0.587, 0.114 };
+    const gray_m: [20]f32 = .{
+        lw[0], lw[1], lw[2], 0, 0,
+        lw[0], lw[1], lw[2], 0, 0,
+        lw[0], lw[1], lw[2], 0, 0,
+        0,     0,     0,     1, 0,
+    };
+    var px2 = [_]u32{100 | (150 << 8) | (200 << 16) | (255 << 24)};
+    colorMatrixU32(&px2, &gray_m);
+    // 0.299·100 + 0.587·150 + 0.114·200 = 140.75 → 141 on all three channels.
+    try std.testing.expectEqual(@as(u32, 141 | (141 << 8) | (141 << 16) | (255 << 24)), px2[0]);
 }

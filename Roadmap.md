@@ -22,10 +22,17 @@ and JS-compatible; see COMPATIBILITY.md "simdra extensions":
   ImageData/encoder boundaries convert back to RGBA. bgra8888 was cheaper
   than every format listed below (same 4 B/px, pure lane permutation).
 
-Follow-up (not started): **gradient ramp LUT** — a 256-entry per-gradient
-ramp cache would make spread + sampling O(1) per pixel, but quantizes `t`
-and risks the pixel-exact gradient assertions in test/index.js (published
-behavior). Needs a bench baseline first (bench/ has no gradient entry yet).
+Second batch (2026-08): **Flash blend modes** `flash_subtract` /
+`flash_invert` / `flash_alpha` / `flash_erase` (enum 27–30, Zig-only,
+`flash_alpha` in the layer-composite class); **`colorMatrixU32`** (4×5,
+Flash ColorMatrixFilter layout) completing the filter primitives next to
+blur/convolve/shadow; **gradient ramp LUT** landed as OPT-IN
+`SmGradient.setSampling(.lut256)` — default `.exact` keeps the pixel-exact
+published behavior, so the earlier quantization concern is moot; and
+`bench/run.js` gained gradient/pattern suites (plus graceful leg skipping
+and the fixed `dist/wasm/index.mjs` path) so shader-path regressions are
+now measurable. Remaining perf follow-up: SIMD row samplers for the
+gradient/pattern per-pixel loops (`SmBlitter.dispatchShader`).
 
 ## Pixel format expansion
 

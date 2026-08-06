@@ -23,6 +23,14 @@ pub const Kind = enum(u8) { linear = 0, radial = 1, conic = 2 };
 /// Append-only — values cross the JS binding as integers.
 pub const Spread = enum(u8) { pad = 0, repeat = 1, reflect = 2 };
 
+/// Stop-lookup strategy. `.exact` (default — the published HTML5 behavior)
+/// scans the stop list and premul-lerps in f64 per pixel. `.lut256` bakes a
+/// 256-entry ramp once and indexes it per pixel — a large win for
+/// gradient-heavy content (Flash), at the cost of quantizing t to 8 bits.
+/// The LUT indexes the spread-FOLDED t, so spread changes need no rebuild;
+/// stop changes rebuild automatically.
+pub const Sampling = enum(u8) { exact = 0, lut256 = 1 };
+
 pub const Stop = struct {
     offset: f64,
     rgba: u32,
@@ -61,6 +69,11 @@ stops: StopList = .{},
 /// Spread mode for t outside [0, 1]. Defaulted so every existing
 /// struct-literal construction (and the HTML5 facade) keeps pad behavior.
 spread: Spread = .pad,
+/// Stop-lookup strategy; see `Sampling`. Defaulted to the exact scan.
+sampling: Sampling = .exact,
+/// Baked 256-entry ramp when `sampling == .lut256`, else null. Owned by
+/// `allocator`; freed in `deinit` / when switching back to `.exact`.
+lut: ?[]u32 = null,
 /// Allocator for stop list growth. JS-binding factories default to
 /// `page_allocator`; pure-Zig callers can use `linearWithAllocator` /
 /// `radialWithAllocator` or set `.allocator = ...` at struct-literal time.
@@ -119,14 +132,46 @@ pub fn conicWithAllocator(allocator: std.mem.Allocator, startAngle: f64, x: f64,
 }
 
 pub fn deinit(self: *SmGradient) void {
+    if (self.lut) |l| {
+        self.allocator.free(l);
+        self.lut = null;
+    }
     self.stops.deinit(self.allocator);
 }
 
 /// setSpread(mode) — select pad / repeat / reflect behavior for t outside
 /// [0, 1]. Setter (not a factory parameter) so the existing factory
-/// arities stay binding-compatible.
+/// arities stay binding-compatible. (The LUT indexes folded t, so no
+/// rebuild is needed here.)
 pub fn setSpread(self: *SmGradient, mode: Spread) void {
     self.spread = mode;
+}
+
+/// setSampling(strategy) — switch between the exact per-pixel stop scan
+/// and the baked 256-entry ramp. Building the ramp allocates once; on
+/// allocation failure the gradient silently stays `.exact` (correct,
+/// just slower).
+pub fn setSampling(self: *SmGradient, s: Sampling) void {
+    self.sampling = s;
+    self.rebuildLut();
+}
+
+fn rebuildLut(self: *SmGradient) void {
+    if (self.sampling != .lut256) {
+        if (self.lut) |l| {
+            self.allocator.free(l);
+            self.lut = null;
+        }
+        return;
+    }
+    const l = self.lut orelse self.allocator.alloc(u32, 256) catch {
+        self.sampling = .exact;
+        return;
+    };
+    self.lut = l;
+    for (l, 0..) |*e, i| {
+        e.* = self.colorAtFolded(@as(f64, @floatFromInt(i)) / 255.0);
+    }
 }
 
 // addColorStop(offset, color) — MDN: insert a color stop at `offset` ∈ [0,1].
@@ -146,6 +191,7 @@ pub fn addColorStop(
     }
     const rgba = css_color.parse(color) orelse return error.Syntax;
     try insertStopSorted(&self.stops, self.allocator, .{ .offset = offset, .rgba = rgba });
+    if (self.sampling == .lut256) self.rebuildLut();
 }
 
 // --- Per-pixel sampling --------------------------------------------------
@@ -200,7 +246,8 @@ inline fn lerpRgbaPremul(lo: u32, hi: u32, t: f64) u32 {
     return r | (g << 8) | (b << 16) | (a << 24);
 }
 
-/// colorAt(t) — spread-folded lookup against the sorted stop list.
+/// colorAt(t) — fold t by the spread mode, then look up: baked ramp when
+/// `.lut256` is active, exact stop scan otherwise.
 fn colorAt(self: *const SmGradient, t: f64) u32 {
     if (self.stops.len == 0) return 0;
     if (self.stops.len == 1) return self.stops.ptr[0].rgba;
@@ -215,6 +262,16 @@ fn colorAt(self: *const SmGradient, t: f64) u32 {
             break :blk if (m > 1.0) 2.0 - m else m;
         },
     };
+    if (self.lut) |l| {
+        return l[@intFromFloat(@round(tc * 255.0))];
+    }
+    return self.colorAtFolded(tc);
+}
+
+/// Exact stop scan over an already-folded tc ∈ [0, 1].
+fn colorAtFolded(self: *const SmGradient, tc: f64) u32 {
+    if (self.stops.len == 0) return 0;
+    if (self.stops.len == 1) return self.stops.ptr[0].rgba;
     var i: usize = 0;
     while (i < self.stops.len and self.stops.ptr[i].offset < tc) : (i += 1) {}
     if (i == 0) return self.stops.ptr[0].rgba;
@@ -351,4 +408,31 @@ test "colorAt reflect mirrors on odd periods" {
 test "default spread is pad and factories stay 4/6-arg" {
     const g = linear(0, 0, 10, 0);
     try std.testing.expectEqual(Spread.pad, g.spread);
+    try std.testing.expectEqual(Sampling.exact, g.sampling);
+}
+
+test "lut256 sampling matches exact at ramp sample points, folds spread" {
+    var g = try testGradientBW(std.testing.allocator);
+    defer g.deinit();
+    g.setSpread(.repeat);
+    g.setSampling(.lut256);
+    try std.testing.expect(g.lut != null);
+    // At exact ramp sample points t = i/255 the LUT is byte-identical to
+    // the exact scan.
+    var i: usize = 0;
+    while (i < 256) : (i += 4) {
+        const t = @as(f64, @floatFromInt(i)) / 255.0;
+        try std.testing.expectEqual(g.colorAtFolded(t), g.colorAt(t));
+    }
+    // Spread folding happens before the LUT: repeat(1.25) hits the same
+    // entry as 0.25.
+    try std.testing.expectEqual(g.colorAt(0.25), g.colorAt(1.25));
+    // Adding a stop rebuilds the ramp (compare at a ramp grid point —
+    // t = 128/255; t = 0.5 itself sits between grid entries).
+    try g.addColorStop(0.5, "#ff0000");
+    const grid = 128.0 / 255.0;
+    try std.testing.expectEqual(g.colorAtFolded(grid), g.colorAt(grid));
+    // Switching back to exact frees the ramp.
+    g.setSampling(.exact);
+    try std.testing.expect(g.lut == null);
 }

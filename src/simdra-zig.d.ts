@@ -133,7 +133,9 @@ declare module '*.zig' {
       | 'multiply' | 'screen' | 'overlay' | 'darken' | 'lighten'
       | 'color_dodge' | 'color_burn' | 'hard_light' | 'soft_light'
       | 'difference' | 'exclusion'
-      | 'hue' | 'saturation' | 'color' | 'luminosity';
+      | 'hue' | 'saturation' | 'color' | 'luminosity'
+      // Flash (SWF) extensions — Zig-only; the HTML5 facade never sets these.
+      | 'flash_subtract' | 'flash_invert' | 'flash_alpha' | 'flash_erase';
     setFillStyle(r: number, g: number, b: number, a: number): void;
     setStrokeStyle(r: number, g: number, b: number, a: number): void;
     setFillGradient(g: SmGradient): void;
@@ -344,12 +346,17 @@ declare module '*.zig' {
 
   // SmGradient — Skia: SkGradientShader. Construction via SmGradient.linear /
   // SmGradient.radial static factories.
+  // Stop-lookup strategy: 0 = exact scan (default, published behavior),
+  // 1 = baked 256-entry ramp (opt-in; quantizes t to 8 bits).
+  export type SmGradientSampling = 0 | 1;
+
   export interface SmGradient {
     readonly kind: 'linear' | 'radial';
     x0: number; y0: number; r0: number;
     x1: number; y1: number; r1: number;
     addColorStop(offset: number, color: string): void;
     setSpread(mode: SmGradientSpread): void;
+    setSampling(s: SmGradientSampling): void;
     deinit(): void;
   }
 

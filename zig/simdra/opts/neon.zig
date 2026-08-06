@@ -149,6 +149,17 @@ pub const blendLuminosityCovBgraU32 = generic.blendLuminosityCovBgraU32;
 pub const swizzleRB = generic.swizzleRB;
 pub const swizzleRBCopyU32 = generic.swizzleRBCopyU32;
 
+// Flash (SWF) blend modes — subtract/invert/alpha/erase (PlaceObject3).
+pub const blendFlashSubtractU32 = generic.blendFlashSubtractU32;
+pub const blendFlashInvertU32 = generic.blendFlashInvertU32;
+pub const blendFlashAlphaU32 = generic.blendFlashAlphaU32;
+pub const blendFlashEraseU32 = generic.blendFlashEraseU32;
+pub const blendFlashSubtractCovU32 = generic.blendFlashSubtractCovU32;
+pub const blendFlashInvertCovU32 = generic.blendFlashInvertCovU32;
+pub const blendFlashAlphaCovU32 = generic.blendFlashAlphaCovU32;
+pub const blendFlashEraseCovU32 = generic.blendFlashEraseCovU32;
+pub const colorMatrixU32 = generic.colorMatrixU32;
+
 pub const sampleImageNearestRow = generic.sampleImageNearestRow;
 pub const sampleImageBilinearRow = generic.sampleImageBilinearRow;
 pub const NearestSampleChunkPixels = generic.NearestSampleChunkPixels;

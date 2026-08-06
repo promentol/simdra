@@ -249,6 +249,11 @@ inline fn dispatchCoverage(
         .saturation => simd.blendSaturationCovU32(row, solid_color, cov),
         .color => simd.blendColorCovU32(row, solid_color, cov),
         .luminosity => simd.blendLuminosityCovU32(row, solid_color, cov),
+        // Flash (SWF) modes.
+        .flash_subtract => simd.blendFlashSubtractCovU32(row, solid_color, cov),
+        .flash_invert => simd.blendFlashInvertCovU32(row, solid_color, cov),
+        .flash_alpha => simd.blendFlashAlphaCovU32(row, solid_color, cov),
+        .flash_erase => simd.blendFlashEraseCovU32(row, solid_color, cov),
     }
 }
 
@@ -407,6 +412,50 @@ test "blitRowFromSource applies cxform to sampled rows (drawImage tint)" {
     try std.testing.expectEqual(@as(u32, 100 | (164 << 8) | (50 << 16) | (255 << 24)), dst[0]);
 }
 
+test "flash blend modes: exact formulas on one pixel" {
+    const dst0: u32 = 100 | (150 << 8) | (200 << 16) | (255 << 24);
+    const src_half: u32 = 60 | (80 << 8) | (255 << 16) | (128 << 24);
+
+    // subtract: out.rgb = max(dst − src·sa, 0), out.a = da.
+    {
+        var px = [_]u32{dst0};
+        const p: SmPaint = .{ .shader = .{ .solid = src_half }, .blend_mode = .flash_subtract };
+        blitRow(&px, 1, 0, 0, 1, null, &p, null);
+        try std.testing.expectEqual(@as(u32, 70 | (110 << 8) | (72 << 16) | (255 << 24)), px[0]);
+    }
+    // subtract with transparent src is a no-op.
+    {
+        var px = [_]u32{dst0};
+        const p: SmPaint = .{ .shader = .{ .solid = 0x00FFFFFF }, .blend_mode = .flash_subtract };
+        blitRow(&px, 1, 0, 0, 1, null, &p, null);
+        try std.testing.expectEqual(dst0, px[0]);
+    }
+    // invert at full source alpha: out.rgb = 255 − dst.
+    {
+        var px = [_]u32{dst0};
+        const p: SmPaint = .{ .shader = .{ .solid = 0xFF000000 }, .blend_mode = .flash_invert };
+        blitRow(&px, 1, 0, 0, 1, null, &p, null);
+        try std.testing.expectEqual(@as(u32, 155 | (105 << 8) | (55 << 16) | (255 << 24)), px[0]);
+    }
+    // alpha: out.a = da·sa, rgb untouched.
+    {
+        var px = [_]u32{100 | (150 << 8) | (200 << 16) | (200 << 24)};
+        const p: SmPaint = .{ .shader = .{ .solid = src_half }, .blend_mode = .flash_alpha };
+        blitRow(&px, 1, 0, 0, 1, null, &p, null);
+        try std.testing.expectEqual(@as(u32, 100 | (150 << 8) | (200 << 16) | (100 << 24)), px[0]);
+    }
+    // erase: out.a = da·(1 − sa), rgb untouched.
+    {
+        var px = [_]u32{100 | (150 << 8) | (200 << 16) | (200 << 24)};
+        const p: SmPaint = .{ .shader = .{ .solid = src_half }, .blend_mode = .flash_erase };
+        blitRow(&px, 1, 0, 0, 1, null, &p, null);
+        try std.testing.expectEqual(@as(u32, 100 | (150 << 8) | (200 << 16) | (100 << 24)), px[0]);
+    }
+    // flash_alpha zeroes dst alpha outside the source → layer-composite class.
+    try std.testing.expect(SmPaint.BlendMode.flash_alpha.requiresLayerComposite());
+    try std.testing.expect(!SmPaint.BlendMode.flash_erase.requiresLayerComposite());
+}
+
 test "swizzleRBCopyU32 kernel matches scalar on vector body + tail" {
     var src: [37]u32 = undefined;
     for (&src, 0..) |*p, i| p.* = @as(u32, @truncate(i *% 0x01020304)) ^ 0xA5C3;
@@ -542,5 +591,10 @@ inline fn dispatchSolid(row: []u32, paint: *const SmPaint, ct: types.ColorType) 
         .saturation => simd.blendSaturationU32(row, solid),
         .color => simd.blendColorU32(row, solid),
         .luminosity => simd.blendLuminosityU32(row, solid),
+        // Flash (SWF) modes.
+        .flash_subtract => simd.blendFlashSubtractU32(row, solid),
+        .flash_invert => simd.blendFlashInvertU32(row, solid),
+        .flash_alpha => simd.blendFlashAlphaU32(row, solid),
+        .flash_erase => simd.blendFlashEraseU32(row, solid),
     }
 }

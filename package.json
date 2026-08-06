@@ -1,6 +1,6 @@
 {
   "name": "simdra",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "SIMD-accelerated 2D canvas and image manipulation, in a Worker. HTML5 Canvas API + sharp-shaped fluent surface. Cloudflare Workers, browsers, edge.",
   "type": "module",
   "main": "./dist/core/index.js",

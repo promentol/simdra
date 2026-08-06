@@ -6,10 +6,58 @@
 //!
 //! Pure value type — no allocator needed.
 
+const std = @import("std");
 const SmGradient = @import("../effects/SmGradient.zig");
 const SmPattern = @import("../effects/SmPattern.zig");
 
 const SmPaint = @This();
+
+/// Per-paint source-color transform — the shape of a SWF CXFORM: a
+/// per-channel multiply (8.8 fixed point) plus a per-channel add, alpha
+/// included, applied to straight-alpha source colors post-shader /
+/// pre-blend. simdra extension used by the Flash renderer (fades, tints,
+/// flashes are all cxform tweens); identity by default so it costs one
+/// branch when unused.
+pub const ColorTransform = struct {
+    /// 8.8 fixed-point multipliers [r, g, b, a]; 256 = 1.0.
+    mult: [4]i16 = .{ 256, 256, 256, 256 },
+    /// Per-channel adds in [-255, 255], [r, g, b, a].
+    add: [4]i16 = .{ 0, 0, 0, 0 },
+
+    pub inline fn isIdentity(self: ColorTransform) bool {
+        return self.mult[0] == 256 and self.mult[1] == 256 and
+            self.mult[2] == 256 and self.mult[3] == 256 and
+            self.add[0] == 0 and self.add[1] == 0 and
+            self.add[2] == 0 and self.add[3] == 0;
+    }
+
+    /// apply(rgba) — per channel c: clamp(((c · mult) >> 8) + add, 0, 255).
+    /// Straight-alpha in, straight-alpha out; pure integer math (the SWF
+    /// evaluation order, arithmetic shift for negative multipliers).
+    pub inline fn apply(self: ColorTransform, rgba: u32) u32 {
+        var out: u32 = 0;
+        inline for (0..4) |i| {
+            const c: i32 = @intCast((rgba >> (8 * i)) & 0xFF);
+            const v = ((c * @as(i32, self.mult[i])) >> 8) + @as(i32, self.add[i]);
+            const clamped: u32 = @intCast(std.math.clamp(v, 0, 255));
+            out |= clamped << (8 * i);
+        }
+        return out;
+    }
+
+    /// Compose: `self` applied AFTER `inner` (parent ∘ child — the SWF
+    /// display-list concatenation rule for nested clips).
+    pub fn concat(self: ColorTransform, inner: ColorTransform) ColorTransform {
+        var r: ColorTransform = .{};
+        inline for (0..4) |i| {
+            const m = (@as(i32, self.mult[i]) * @as(i32, inner.mult[i])) >> 8;
+            const a = ((@as(i32, inner.add[i]) * @as(i32, self.mult[i])) >> 8) + @as(i32, self.add[i]);
+            r.mult[i] = @intCast(std.math.clamp(m, std.math.minInt(i16), std.math.maxInt(i16)));
+            r.add[i] = @intCast(std.math.clamp(a, -255, 255));
+        }
+        return r;
+    }
+};
 
 /// Source for paint output. The blitter dispatches per-arm:
 ///   • `.solid`     → SIMD blend kernels (fast path).
@@ -141,6 +189,13 @@ blend_mode: BlendMode = .src_over,
 /// applies it per pixel after the sampler — so changing `globalAlpha`
 /// between draw calls doesn't require resampling stops.
 global_alpha: u8 = 0xFF,
+/// Per-paint color transform. Same fold/carry split as `global_alpha`:
+/// solid paints fold it at construction (`SmCanvas.paintFromShader`) and
+/// emit identity here; gradient/pattern/drawImage paints carry it and
+/// `SmBlitter` applies it per pixel post-sample, BEFORE the alpha
+/// modulators. The one-pixel paints the blitter synthesizes stay identity
+/// so already-transformed colors are never transformed twice.
+cxform: ColorTransform = .{},
 
 // ---------------------------------------------------------------------------
 // Static factories — Skia-style.
@@ -166,4 +221,44 @@ pub inline fn includesFill(self: Style) bool {
 
 pub inline fn includesStroke(self: Style) bool {
     return self == .stroke or self == .fill_and_stroke;
+}
+
+// --- Tests ---------------------------------------------------------------
+
+test "ColorTransform identity" {
+    const id: ColorTransform = .{};
+    try std.testing.expect(id.isIdentity());
+    try std.testing.expectEqual(@as(u32, 0x80FF8040), id.apply(0x80FF8040));
+}
+
+test "ColorTransform mult+add per channel with clamping" {
+    // src (r,g,b,a) = (200, 100, 50, 255)
+    const src: u32 = 200 | (100 << 8) | (50 << 16) | (255 << 24);
+    const t: ColorTransform = .{
+        .mult = .{ 128, 256, 256, 256 }, // r × 0.5
+        .add = .{ 0, 64, 0, -128 },
+    };
+    try std.testing.expect(!t.isIdentity());
+    const out = t.apply(src);
+    try std.testing.expectEqual(@as(u32, 100), out & 0xFF); // (200·128)>>8
+    try std.testing.expectEqual(@as(u32, 164), (out >> 8) & 0xFF); // 100+64
+    try std.testing.expectEqual(@as(u32, 50), (out >> 16) & 0xFF);
+    try std.testing.expectEqual(@as(u32, 127), (out >> 24) & 0xFF); // 255-128
+
+    const sat: ColorTransform = .{ .add = .{ 255, -255, 0, 0 } };
+    const out2 = sat.apply(src);
+    try std.testing.expectEqual(@as(u32, 255), out2 & 0xFF); // clamped high
+    try std.testing.expectEqual(@as(u32, 0), (out2 >> 8) & 0xFF); // clamped low
+}
+
+test "ColorTransform concat matches sequential application" {
+    const parent: ColorTransform = .{ .mult = .{ 128, 256, 256, 256 }, .add = .{ 100, 0, 0, 0 } };
+    const child: ColorTransform = .{ .mult = .{ 128, 256, 256, 256 }, .add = .{ 50, 0, 0, 0 } };
+    const combined = parent.concat(child);
+    // Sequential vs concat can differ by 1 LSB from double rounding; the
+    // chosen fixtures land exactly.
+    const src: u32 = 200; // red channel only
+    try std.testing.expectEqual(parent.apply(child.apply(src)), combined.apply(src));
+    try std.testing.expectEqual(@as(i16, 64), combined.mult[0]); // 0.5·0.5
+    try std.testing.expectEqual(@as(i16, 125), combined.add[0]); // 50·0.5+100
 }

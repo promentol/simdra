@@ -58,6 +58,7 @@ pub const StateFrame = struct {
     clipMask: ?[]u8,
     alpha: u8,
     blendMode: SmPaint.BlendMode,
+    cxform: SmPaint.ColorTransform,
     imageSmoothingEnabled: bool,
     imageSmoothingQuality: u8,
     shadowBlur: f64,
@@ -120,6 +121,10 @@ alpha: u8 = 0xFF,
 /// JS `ctx.globalCompositeOperation` (HTML5 string) wraps this through a
 /// getter/setter in `src/index.ts`.
 blendMode: SmPaint.BlendMode = .src_over,
+/// Color transform for new paints (simdra extension — SWF CXFORM shape).
+/// Identity by default; no HTML5 surface. Folded/carried exactly like
+/// `alpha` — see `paintFromShader`. Saved/restored with the state stack.
+cxform: SmPaint.ColorTransform = .{},
 /// Current transformation matrix (CTM). Mirrors HTML5's CTM and Skia's
 /// `SkCanvas` matrix. Identity by default. Modified by `translate / rotate
 /// / scale / transform / setTransform / resetTransform`. Saved/restored
@@ -433,6 +438,7 @@ pub fn reset(self: *SmCanvas) void {
     self.lineDashOffset = 0;
     self.alpha = 0xFF;
     self.blendMode = .src_over;
+    self.cxform = .{};
     self.current_transform = .{};
     self.imageSmoothingEnabled = true;
     self.imageSmoothingQuality = 0;
@@ -445,6 +451,14 @@ pub fn reset(self: *SmCanvas) void {
 }
 
 pub const GetImageDataError = SmBitmap.FromSurfaceError;
+
+/// setColorTransform(t) — simdra extension (SWF CXFORM). Applies to every
+/// subsequently constructed paint (fills, strokes, text, drawImage) until
+/// changed; pass `.{}` (identity) to disable. Saved/restored with the
+/// state stack; reset() clears it. No HTML5 surface.
+pub fn setColorTransform(self: *SmCanvas, t: SmPaint.ColorTransform) void {
+    self.cxform = t;
+}
 
 pub fn setFillStyle(self: *SmCanvas, r: u8, g: u8, b: u8, a: u8) void {
     self.fillStyle = .{ .solid = types.packRGBA(r, g, b, a) };
@@ -610,6 +624,7 @@ pub fn save(self: *SmCanvas) void {
         .clipMask = saved_clip,
         .alpha = self.alpha,
         .blendMode = self.blendMode,
+        .cxform = self.cxform,
         .imageSmoothingEnabled = self.imageSmoothingEnabled,
         .imageSmoothingQuality = self.imageSmoothingQuality,
         .shadowBlur = self.shadowBlur,
@@ -652,6 +667,7 @@ pub fn restore(self: *SmCanvas) void {
     self.clip_mask = frame.clipMask;
     self.alpha = frame.alpha;
     self.blendMode = frame.blendMode;
+    self.cxform = frame.cxform;
     self.imageSmoothingEnabled = frame.imageSmoothingEnabled;
     self.imageSmoothingQuality = frame.imageSmoothingQuality;
     self.shadowBlur = frame.shadowBlur;
@@ -686,12 +702,12 @@ inline fn applyAlphaModulation(color: u32, modulator: u8) u32 {
 /// bit-exact); for `.gradient` / `.pattern` the alpha modulator rides along
 /// on `paint.global_alpha` and is applied per-pixel by `SmBlitter`.
 fn paintForFill(self: *const SmCanvas) SmPaint {
-    return paintFromShader(self.fillStyle, .fill, 0, self.alpha, self.blendMode);
+    return paintFromShader(self.fillStyle, .fill, 0, self.alpha, self.blendMode, self.cxform);
 }
 
 /// Build a stroke SmPaint from the current ctx state.
 fn paintForStroke(self: *const SmCanvas) SmPaint {
-    return paintFromShader(self.strokeStyle, .stroke, self.lineWidth, self.alpha, self.blendMode);
+    return paintFromShader(self.strokeStyle, .stroke, self.lineWidth, self.alpha, self.blendMode, self.cxform);
 }
 
 inline fn paintFromShader(
@@ -700,10 +716,17 @@ inline fn paintFromShader(
     stroke_width: f64,
     alpha: u8,
     blend_mode: SmPaint.BlendMode,
+    cxform: SmPaint.ColorTransform,
 ) SmPaint {
     return switch (shader) {
         .solid => |c| .{
-            .shader = .{ .solid = applyAlphaModulation(c, alpha) },
+            // Fold order matches the blitter's per-pixel order: color
+            // transform first, then the alpha modulator. Emit identity
+            // cxform so the folded color is never transformed again.
+            .shader = .{ .solid = applyAlphaModulation(
+                if (cxform.isIdentity()) c else cxform.apply(c),
+                alpha,
+            ) },
             .style = style,
             .stroke_width = stroke_width,
             .blend_mode = blend_mode,
@@ -715,6 +738,7 @@ inline fn paintFromShader(
             .stroke_width = stroke_width,
             .blend_mode = blend_mode,
             .global_alpha = alpha,
+            .cxform = cxform,
         },
     };
 }
@@ -1673,7 +1697,7 @@ fn strokeInternal(self: *SmCanvas, path: *const SmPath) void {
     defer self.endCompositeLayer(layer);
     // strokePath takes a fill-shaped paint (it inflates the outline polygon
     // and fills it through the same scan pipeline as fillPath).
-    var paint = paintFromShader(self.strokeStyle, .fill, 0, self.alpha, self.blendMode);
+    var paint = paintFromShader(self.strokeStyle, .fill, 0, self.alpha, self.blendMode, self.cxform);
     const clip_mask: ?[]const u8 = if (self.clip_mask) |m| m else null;
     const aa = self.ensureAaScratch() orelse return;
     SmScan.strokePath(
@@ -1827,7 +1851,7 @@ pub fn strokeTriangle(
     path.closePath();
     // strokePath takes a fill-shaped paint (it inflates the outline polygon
     // and fills it through the same scan pipeline as fillPath).
-    var paint = paintFromShader(self.strokeStyle, .fill, 0, self.alpha, self.blendMode);
+    var paint = paintFromShader(self.strokeStyle, .fill, 0, self.alpha, self.blendMode, self.cxform);
     const aa = self.ensureAaScratch() orelse return;
     const clip_mask: ?[]const u8 = if (self.clip_mask) |m| m else null;
     SmScan.strokePath(
@@ -2028,6 +2052,7 @@ pub fn drawImageScaledSub(
         .style = .fill,
         .blend_mode = self.blendMode,
         .global_alpha = self.alpha,
+        .cxform = self.cxform, // tints sampled image rows per pixel
     };
 
     var py: i32 = dst_y0_i;

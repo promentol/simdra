@@ -157,9 +157,11 @@ inline fn dispatchShader(
             .pattern => |p| p.sample(px, py),
             .solid => unreachable,
         };
-        // FUNNEL: per-paint source-color transforms for sampled shaders
-        // apply HERE (post-sample, before the alpha modulators below) —
-        // the counterpart of `resolveSolid` on the solid paths.
+        // Per-paint color transform: post-sample, before the alpha
+        // modulators — the counterpart of `resolveSolid` on solid paths.
+        if (!paint.cxform.isIdentity()) {
+            src = paint.cxform.apply(src);
+        }
         // Fold paint.global_alpha into the source alpha (premul-aware via
         // simple 8-bit multiply — the rest of the pipeline uses straight
         // alpha; the per-mode kernel handles its own premul math).
@@ -242,7 +244,9 @@ inline fn solidColorOf(shader: SmPaint.Shader) u32 {
 /// default-initialized transform state, so colors that were already
 /// resolved per-pixel are not transformed a second time.
 pub inline fn resolveSolid(paint: *const SmPaint) u32 {
-    return solidColorOf(paint.shader);
+    const c = solidColorOf(paint.shader);
+    if (paint.cxform.isIdentity()) return c;
+    return paint.cxform.apply(c);
 }
 
 /// blitRowFromSource — write a row of per-pixel source colors onto `dst`
@@ -266,8 +270,11 @@ pub fn blitRowFromSource(
     var i: usize = 0;
     while (i < dst.len) : (i += 1) {
         var s: u32 = src[i];
-        // FUNNEL: per-paint source-color transforms for pre-sampled rows
-        // (drawImage) apply HERE, before the alpha modulators below.
+        // Per-paint color transform for pre-sampled rows (drawImage tint),
+        // before the alpha modulators below.
+        if (!paint.cxform.isIdentity()) {
+            s = paint.cxform.apply(s);
+        }
         if (paint.global_alpha != 0xFF) {
             s = modulateAlpha(s, paint.global_alpha);
         }
@@ -318,6 +325,51 @@ test "blitRow src_over on opaque solid overwrites the row" {
     const p: SmPaint = .{ .shader = .{ .solid = 0xFF0000FF }, .blend_mode = .src_over };
     blitRow(&px, 3, 0, 0, 3, null, &p, null);
     for (px) |c| try std.testing.expectEqual(@as(u32, 0xFF0000FF), c);
+}
+
+test "resolveSolid applies a non-identity cxform exactly once" {
+    // (200,100,50,255) with r×0.5, g+64, a−128 → (100,164,50,127).
+    const src: u32 = 200 | (100 << 8) | (50 << 16) | (255 << 24);
+    const expect: u32 = 100 | (164 << 8) | (50 << 16) | (127 << 24);
+    const p: SmPaint = .{
+        .shader = .{ .solid = src },
+        .cxform = .{ .mult = .{ 128, 256, 256, 256 }, .add = .{ 0, 64, 0, -128 } },
+    };
+    try std.testing.expectEqual(expect, resolveSolid(&p));
+}
+
+test "cxform identity blit is byte-identical to a plain blit" {
+    var a = [_]u32{ 0xFF336699, 0xFF336699 };
+    var b = a;
+    const plain: SmPaint = .{ .shader = .{ .solid = 0x80FF8040 }, .blend_mode = .src_over };
+    var with_id = plain;
+    with_id.cxform = .{};
+    blitRow(&a, 2, 0, 0, 2, null, &plain, null);
+    blitRow(&b, 2, 0, 0, 2, null, &with_id, null);
+    try std.testing.expectEqualSlices(u32, &a, &b);
+}
+
+test "cxform alpha-mult zero leaves dst unchanged under src_over" {
+    var px = [_]u32{0xFF112233};
+    const p: SmPaint = .{
+        .shader = .{ .solid = 0xFFFFFFFF },
+        .blend_mode = .src_over,
+        .cxform = .{ .mult = .{ 256, 256, 256, 0 } },
+    };
+    blitRow(&px, 1, 0, 0, 1, null, &p, null);
+    try std.testing.expectEqual(@as(u32, 0xFF112233), px[0]);
+}
+
+test "blitRowFromSource applies cxform to sampled rows (drawImage tint)" {
+    var dst = [_]u32{0x00000000};
+    const src = [_]u32{200 | (100 << 8) | (50 << 16) | (255 << 24)};
+    const p: SmPaint = .{
+        .shader = .{ .solid = 0 },
+        .blend_mode = .src_over,
+        .cxform = .{ .mult = .{ 128, 256, 256, 256 }, .add = .{ 0, 64, 0, 0 } },
+    };
+    blitRowFromSource(&dst, &src, &p, null);
+    try std.testing.expectEqual(@as(u32, 100 | (164 << 8) | (50 << 16) | (255 << 24)), dst[0]);
 }
 
 inline fn dispatchSolid(row: []u32, paint: *const SmPaint) void {

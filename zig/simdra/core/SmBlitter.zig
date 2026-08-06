@@ -84,7 +84,7 @@ pub fn blitRow(
         // HTML5 clearRect-under-clip output (transparent src would leave
         // dst unchanged). Handle directly with a per-pixel mask write.
         if (paint.blend_mode == .src) {
-            const solid_color = solidColorOf(paint.shader);
+            const solid_color = resolveSolid(paint);
             if (coverage) |cov| {
                 for (0..n) |i| {
                     if (cr[i] != 0 and cov[i] != 0) row[i] = solid_color;
@@ -110,7 +110,7 @@ pub fn blitRow(
         } else {
             @memcpy(eff, cr);
         }
-        const solid_color = solidColorOf(paint.shader);
+        const solid_color = resolveSolid(paint);
         dispatchCoverage(row, solid_color, eff, paint.blend_mode);
         return;
     }
@@ -123,7 +123,7 @@ pub fn blitRow(
         // edges, glyph outlines, and tile-based rasterization all produce
         // visually correct output across every HTML5 composite operator.
         // `src_over` / `src` / `copy` keep the optimized fast path.
-        const solid_color = solidColorOf(paint.shader);
+        const solid_color = resolveSolid(paint);
         dispatchCoverage(row, solid_color, cov, paint.blend_mode);
         return;
     }
@@ -157,6 +157,9 @@ inline fn dispatchShader(
             .pattern => |p| p.sample(px, py),
             .solid => unreachable,
         };
+        // FUNNEL: per-paint source-color transforms for sampled shaders
+        // apply HERE (post-sample, before the alpha modulators below) —
+        // the counterpart of `resolveSolid` on the solid paths.
         // Fold paint.global_alpha into the source alpha (premul-aware via
         // simple 8-bit multiply — the rest of the pipeline uses straight
         // alpha; the per-mode kernel handles its own premul math).
@@ -231,6 +234,17 @@ inline fn solidColorOf(shader: SmPaint.Shader) u32 {
     };
 }
 
+/// Resolve a `.solid` paint to the source color the blend kernels consume.
+/// This is THE funnel for per-paint source-color transforms: every solid
+/// draw path (rect fast path, AA coverage fill, glyphs, clip variants)
+/// resolves its color here exactly once. The one-pixel paints synthesized
+/// by `dispatchShader` / `blitRowFromSource` / `blitFull` carry
+/// default-initialized transform state, so colors that were already
+/// resolved per-pixel are not transformed a second time.
+pub inline fn resolveSolid(paint: *const SmPaint) u32 {
+    return solidColorOf(paint.shader);
+}
+
 /// blitRowFromSource — write a row of per-pixel source colors onto `dst`
 /// per `paint.blend_mode`, modulated by `paint.global_alpha` and the
 /// optional row-shaped `clip_row`. Used by `SmCanvas.drawImageScaledSub`
@@ -252,6 +266,8 @@ pub fn blitRowFromSource(
     var i: usize = 0;
     while (i < dst.len) : (i += 1) {
         var s: u32 = src[i];
+        // FUNNEL: per-paint source-color transforms for pre-sampled rows
+        // (drawImage) apply HERE, before the alpha modulators below.
         if (paint.global_alpha != 0xFF) {
             s = modulateAlpha(s, paint.global_alpha);
         }
@@ -292,8 +308,20 @@ pub fn blitFull(dst: []u32, src: []const u32, mode: SmPaint.BlendMode) void {
     }
 }
 
+test "resolveSolid forwards the solid color unchanged" {
+    const p: SmPaint = .{ .shader = .{ .solid = 0x80FF8040 } };
+    try std.testing.expectEqual(@as(u32, 0x80FF8040), resolveSolid(&p));
+}
+
+test "blitRow src_over on opaque solid overwrites the row" {
+    var px = [_]u32{ 0xFF000000, 0xFF000000, 0xFF000000 };
+    const p: SmPaint = .{ .shader = .{ .solid = 0xFF0000FF }, .blend_mode = .src_over };
+    blitRow(&px, 3, 0, 0, 3, null, &p, null);
+    for (px) |c| try std.testing.expectEqual(@as(u32, 0xFF0000FF), c);
+}
+
 inline fn dispatchSolid(row: []u32, paint: *const SmPaint) void {
-    const solid = solidColorOf(paint.shader);
+    const solid = resolveSolid(paint);
     switch (paint.blend_mode) {
         // Internal — clearRect uses this directly.
         .src, .copy => simd.fillU32(row, solid),

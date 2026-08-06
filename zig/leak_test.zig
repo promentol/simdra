@@ -39,7 +39,7 @@ test "SmSurface basic draw stack — no leaks" {
     ctx.lineTo(28, 28);
     ctx.lineTo(20, 28);
     ctx.closePath();
-    ctx.fill();
+    ctx.fill(.nonzero);
 
     ctx.setStrokeStyle(0x00, 0x00, 0xFF, 0xFF);
     ctx.setLineWidth(2);

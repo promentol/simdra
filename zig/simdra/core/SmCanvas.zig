@@ -1368,7 +1368,11 @@ pub fn drawRect(self: *SmCanvas, x: f64, y: f64, w: f64, h: f64, paint: *const S
         const tr = self.current_transform.applyToPoint(x + w, y);
         const br = self.current_transform.applyToPoint(x + w, y + h);
         const bl = self.current_transform.applyToPoint(x, y + h);
-        const fp: SmPaint = .{ .shader = paint.shader, .style = .fill };
+        // Copy-and-override so blend_mode / global_alpha (and any future
+        // per-paint state) propagate — a bare `.{ .shader = …, .style = … }`
+        // literal silently dropped them here.
+        var fp = paint.*;
+        fp.style = .fill;
         const aa = self.ensureAaScratch() orelse return;
         const clip_mask: ?[]const u8 = if (self.clip_mask) |m| m else null;
         const verts = [_][2]f64{
@@ -1405,12 +1409,9 @@ pub fn drawRect(self: *SmCanvas, x: f64, y: f64, w: f64, h: f64, paint: *const S
         p.lineTo(br[0], br[1]);
         p.lineTo(bl[0], bl[1]);
         p.closePath();
-        var sp: SmPaint = .{
-            .shader = paint.shader,
-            .style = .fill,
-            .blend_mode = paint.blend_mode,
-            .global_alpha = paint.global_alpha,
-        };
+        // Copy-and-override (same rationale as the fill arm above).
+        var sp = paint.*;
+        sp.style = .fill;
         const aa = self.ensureAaScratch() orelse return;
         const clip_mask: ?[]const u8 = if (self.clip_mask) |m| m else null;
         SmScan.strokePath(
@@ -1507,14 +1508,11 @@ fn drawRectAxisAligned(
     if (SmPaint.includesStroke(paint.style)) {
         const lw: f64 = paint.stroke_width;
         const half: f64 = lw / 2.0;
-        // Propagate blend_mode + global_alpha so non-default composite /
-        // globalAlpha state survives the stroke-as-4-rects decomposition.
-        const edge: SmPaint = .{
-            .shader = paint.shader,
-            .style = .fill,
-            .blend_mode = paint.blend_mode,
-            .global_alpha = paint.global_alpha,
-        };
+        // Copy-and-override so ALL per-paint state (blend_mode,
+        // global_alpha, and any future fields) survives the
+        // stroke-as-4-rects decomposition.
+        var edge = paint.*;
+        edge.style = .fill;
         fillRectSpan(self, x - half, y - half, w + lw, lw, &edge);
         fillRectSpan(self, x - half, y + h - half, w + lw, lw, &edge);
         fillRectSpan(self, x - half, y + half, lw, h - lw, &edge);

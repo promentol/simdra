@@ -98,6 +98,15 @@ pub fn blendSrcOverU32(dst: []u32, src_color: u32) void {
 //
 // Scalar today; vectorize when this kernel shows up on a profile (the
 // outer per-pixel work is identical to blendSrcOverU32 with cov layered on).
+/// `x * y / 255`, exactly, in shifts. The bare `(x*y + 128) >> 8` is a
+/// unit short at the top — 255*255 lands on 254 — and that is visible
+/// whenever a FULLY covered pixel goes through the coverage path, which
+/// is what a clip mask makes every masked pixel do.
+inline fn mul255(x: u32, y: u32) u32 {
+    const t: u32 = x * y + 0x80;
+    return (t + (t >> 8)) >> 8;
+}
+
 pub fn blendSrcOverCovU32(dst: []u32, src_color: u32, coverage: []const u8) void {
     std.debug.assert(dst.len == coverage.len);
     const sa: u32 = (src_color >> 24) & 0xFF;
@@ -111,24 +120,48 @@ pub fn blendSrcOverCovU32(dst: []u32, src_color: u32, coverage: []const u8) void
     while (i < dst.len) : (i += 1) {
         const cov: u32 = coverage[i];
         if (cov == 0) continue;
-        // `a_eff = sa * cov / 255` via the (x*y + 128) >> 8 approximation.
-        const a_eff: u32 = (sa * cov + 0x80) >> 8;
+        const a_eff: u32 = mul255(sa, cov);
         if (a_eff == 0) continue;
         const inv_a: u32 = 255 - a_eff;
-        // Premultiply src.rgb by a_eff / 255 (same approximation).
-        const r_eff: u32 = (sr * a_eff + 0x80) >> 8;
-        const g_eff: u32 = (sg * a_eff + 0x80) >> 8;
-        const b_eff: u32 = (sb * a_eff + 0x80) >> 8;
+        const r_eff: u32 = mul255(sr, a_eff);
+        const g_eff: u32 = mul255(sg, a_eff);
+        const b_eff: u32 = mul255(sb, a_eff);
         const dst_p = dst[i];
         const dr: u32 = dst_p & 0xFF;
         const dg: u32 = (dst_p >> 8) & 0xFF;
         const db: u32 = (dst_p >> 16) & 0xFF;
         const da: u32 = (dst_p >> 24) & 0xFF;
-        const r: u32 = r_eff + ((dr * inv_a + 0x80) >> 8);
-        const g: u32 = g_eff + ((dg * inv_a + 0x80) >> 8);
-        const b: u32 = b_eff + ((db * inv_a + 0x80) >> 8);
-        const a: u32 = a_eff + ((da * inv_a + 0x80) >> 8);
-        dst[i] = r | (g << 8) | (b << 16) | (a << 24);
+        const r: u32 = r_eff + mul255(dr, inv_a);
+        const g: u32 = g_eff + mul255(dg, inv_a);
+        const b: u32 = b_eff + mul255(db, inv_a);
+        const a: u32 = a_eff + mul255(da, inv_a);
+        if (da == 0xFF) {
+            // Opaque destination: the output alpha is 255, so the
+            // premultiplied sum above IS the straight colour.
+            dst[i] = r | (g << 8) | (b << 16) | (a << 24);
+            continue;
+        }
+        // TRANSPARENT or partial destination — a composite layer's
+        // scratch. Surfaces here hold STRAIGHT colour (see
+        // `blendSrcOverU32`, which was already fixed this way), so the
+        // premultiplied sum has to be divided back out. Leaving it
+        // premultiplied writes a colour darkened toward black, and the
+        // next blend to read that layer sees the wrong thing: a white
+        // gradient with a zero-alpha stop came out solid white under
+        // `add` because of it.
+        if (a == 0) {
+            dst[i] = 0;
+            continue;
+        }
+        // CLAMP: rounding can push a channel above its own alpha, and an
+        // un-clamped quotient does not fit in its byte — it bleeds into
+        // the next channel when packed. Which channel gets hit depends on
+        // the surface byte order, so leaving this off breaks the R/B swap
+        // invariant that every non-lum kernel here is required to hold.
+        const ur: u32 = @min(@as(u32, 255), r * 255 / a);
+        const ug: u32 = @min(@as(u32, 255), g * 255 / a);
+        const ub: u32 = @min(@as(u32, 255), b * 255 / a);
+        dst[i] = ur | (ug << 8) | (ub << 16) | (a << 24);
     }
 }
 
@@ -151,9 +184,10 @@ pub fn blendAddU32(dst: []u32, src_color: u32) void {
 
     // Build per-channel src vector (R, G, B, A repeated N times).
     var src_arr: [components]u8 = undefined;
-    const sR: u8 = @intCast(src_color & 0xFF);
-    const sG: u8 = @intCast((src_color >> 8) & 0xFF);
-    const sB: u8 = @intCast((src_color >> 16) & 0xFF);
+    // Weighted by the source's own alpha — see `blendAddScalar`.
+    const sR: u8 = @intCast(mul255(src_color & 0xFF, sa));
+    const sG: u8 = @intCast(mul255((src_color >> 8) & 0xFF, sa));
+    const sB: u8 = @intCast(mul255((src_color >> 16) & 0xFF, sa));
     const sA: u8 = @intCast(sa);
     {
         var k: usize = 0;
@@ -182,10 +216,14 @@ pub fn blendAddU32(dst: []u32, src_color: u32) void {
 }
 
 inline fn blendAddScalar(src: u32, dst: u32) u32 {
-    const sr = src & 0xFF;
-    const sg = (src >> 8) & 0xFF;
-    const sb = (src >> 16) & 0xFF;
+    // The source is STRAIGHT here, as everywhere else in this file (the
+    // Flash kernels below all weight by `sa`), so a translucent white
+    // contributes a translucent white's worth. Adding the raw channels
+    // made a nearly TRANSPARENT white paint solid white.
     const sa = (src >> 24) & 0xFF;
+    const sr = mul255(src & 0xFF, sa);
+    const sg = mul255((src >> 8) & 0xFF, sa);
+    const sb = mul255((src >> 16) & 0xFF, sa);
     const dr = dst & 0xFF;
     const dg = (dst >> 8) & 0xFF;
     const db = (dst >> 16) & 0xFF;
@@ -1125,11 +1163,14 @@ pub fn sampleImageNearestRow(
         const px_v = @as(Vd, @splat(x_start_f)) + i_v + lane_offsets;
         const sx_v = inv_a_v * px_v + inv_c_v * py_v + inv_e_v;
         const sy_v = inv_b_v * px_v + inv_d_v * py_v + inv_f_v;
-        // Per-lane scalar gather + bounds check.
+        // Per-lane scalar gather + bounds check. The lanes are read out
+        // as ARRAYS: a vector cannot be indexed by a runtime value.
+        const sx_lanes: [N]f64 = sx_v;
+        const sy_lanes: [N]f64 = sy_v;
         var lane: usize = 0;
         while (lane < N) : (lane += 1) {
-            const sx_f = sx_v[lane];
-            const sy_f = sy_v[lane];
+            const sx_f = sx_lanes[lane];
+            const sy_f = sy_lanes[lane];
             if (sx_f < src_rect_x or sx_f >= src_rect_x1 or
                 sy_f < src_rect_y or sy_f >= src_rect_y1) continue;
             const sx_int: i32 = @intFromFloat(@floor(sx_f));

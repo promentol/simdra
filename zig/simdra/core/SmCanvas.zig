@@ -187,6 +187,9 @@ filter_blur_scratch: ?[]u8 = null,
 /// AA path-fill row accumulator. Holds per-pixel coverage in [0, 1] across
 /// the 8 sub-y-sample sweep before being packed to u8 in `aa_coverage`.
 /// Sized to `surface.width`. Lazily allocated, freed in `deinit`.
+/// Antialias path coverage. False renders one sample per pixel, which
+/// is what Flash's "low" quality does — see `SmPaint.antialias`.
+antialias: bool = true,
 aa_accum: ?[]f32 = null,
 /// AA path-fill u8 coverage row, fed to `SmBlitter.blitRow`. Sized to
 /// `surface.width`. Lazily allocated, freed in `deinit`.
@@ -702,12 +705,16 @@ inline fn applyAlphaModulation(color: u32, modulator: u8) u32 {
 /// bit-exact); for `.gradient` / `.pattern` the alpha modulator rides along
 /// on `paint.global_alpha` and is applied per-pixel by `SmBlitter`.
 fn paintForFill(self: *const SmCanvas) SmPaint {
-    return paintFromShader(self.fillStyle, .fill, 0, self.alpha, self.blendMode, self.cxform, self.surface.color_type);
+    var p = paintFromShader(self.fillStyle, .fill, 0, self.alpha, self.blendMode, self.cxform, self.surface.color_type);
+    p.antialias = self.antialias;
+    return p;
 }
 
 /// Build a stroke SmPaint from the current ctx state.
 fn paintForStroke(self: *const SmCanvas) SmPaint {
-    return paintFromShader(self.strokeStyle, .stroke, self.lineWidth, self.alpha, self.blendMode, self.cxform, self.surface.color_type);
+    var p = paintFromShader(self.strokeStyle, .stroke, self.lineWidth, self.alpha, self.blendMode, self.cxform, self.surface.color_type);
+    p.antialias = self.antialias;
+    return p;
 }
 
 inline fn paintFromShader(
@@ -794,7 +801,15 @@ inline fn endCompositeLayer(self: *SmCanvas, layer: ?CompositeLayer) void {
     const l = layer orelse return;
     // Scratch (current self.pixels) is the rendered shape on a transparent
     // background; composite it onto the real canvas using the user's mode.
-    SmBlitter.blitFull(l.real_pixels, self.pixels, l.real_blend, self.surface.color_type);
+    // MASKED: these modes write every pixel, so an active clip has to be
+    // honoured here or it does not reach them at all.
+    SmBlitter.blitFullMasked(
+        l.real_pixels,
+        self.pixels,
+        l.real_blend,
+        self.surface.color_type,
+        self.clip_mask,
+    );
     self.pixels = l.real_pixels;
     self.blendMode = l.real_blend;
 }
@@ -1704,6 +1719,7 @@ fn strokeInternal(self: *SmCanvas, path: *const SmPath) void {
     // strokePath takes a fill-shaped paint (it inflates the outline polygon
     // and fills it through the same scan pipeline as fillPath).
     var paint = paintFromShader(self.strokeStyle, .fill, 0, self.alpha, self.blendMode, self.cxform, self.surface.color_type);
+    paint.antialias = self.antialias;
     const clip_mask: ?[]const u8 = if (self.clip_mask) |m| m else null;
     const aa = self.ensureAaScratch() orelse return;
     SmScan.strokePath(
@@ -1759,6 +1775,7 @@ fn clipInternal(self: *SmCanvas, path: *const SmPath, fill_rule: SmScan.FillRule
         self.surface.height,
         path,
         fill_rule,
+        self.antialias,
     ) catch {
         allocator.free(new_mask);
         return;
@@ -1859,6 +1876,7 @@ pub fn strokeTriangle(
     // strokePath takes a fill-shaped paint (it inflates the outline polygon
     // and fills it through the same scan pipeline as fillPath).
     var paint = paintFromShader(self.strokeStyle, .fill, 0, self.alpha, self.blendMode, self.cxform, self.surface.color_type);
+    paint.antialias = self.antialias;
     const aa = self.ensureAaScratch() orelse return;
     const clip_mask: ?[]const u8 = if (self.clip_mask) |m| m else null;
     SmScan.strokePath(

@@ -198,7 +198,13 @@ inline fn dispatchShader(
 
 inline fn modulateAlpha(rgba: u32, modulator: u8) u32 {
     const a: u32 = (rgba >> 24) & 0xFF;
-    const new_a: u32 = (a * @as(u32, modulator) + 0x80) >> 8;
+    // Exact 8-bit multiply: `(a*m + 0x80) >> 8` alone loses a unit at the
+    // top — 255*255 lands on 254, so a fully covered pixel under a fully
+    // opaque clip comes out one short of the colour that was asked for.
+    // Folding the high byte back in makes 255 map to 255 and leaves every
+    // other product unchanged.
+    const t: u32 = a * @as(u32, modulator) + 0x80;
+    const new_a: u32 = (t + (t >> 8)) >> 8;
     return (rgba & 0x00FFFFFF) | (new_a << 24);
 }
 
@@ -340,6 +346,20 @@ pub fn blitRowFromSource(
 /// whose pixel formula yields a non-`dst` result outside the shape's
 /// affected region — those modes need to see every canvas pixel.
 pub fn blitFull(dst: []u32, src: []const u32, mode: SmPaint.BlendMode, ct: types.ColorType) void {
+    blitFullMasked(dst, src, mode, ct, null);
+}
+
+/// `blitFull`, gated by a clip mask. These modes write EVERY pixel — that
+/// is the whole reason they need a layer — so a clip has to be applied
+/// here or it does not apply to them at all. A partial mask value lerps
+/// between the untouched destination and the blended result.
+pub fn blitFullMasked(
+    dst: []u32,
+    src: []const u32,
+    mode: SmPaint.BlendMode,
+    ct: types.ColorType,
+    mask: ?[]const u8,
+) void {
     std.debug.assert(dst.len == src.len);
     // For each pixel, build a one-pixel "paint" and dispatch the same blend
     // logic the row blitter uses. Avoids duplicating per-mode code. Both
@@ -347,12 +367,27 @@ pub fn blitFull(dst: []u32, src: []const u32, mode: SmPaint.BlendMode, ct: types
     // non-separable kernels; no source swizzling happens here).
     var i: usize = 0;
     while (i < dst.len) : (i += 1) {
+        const cov: u8 = if (mask) |m| m[i] else 255;
+        if (cov == 0) continue;
         const single_src = src[i];
-        var single_dst = [_]u32{dst[i]};
+        const before = dst[i];
+        var single_dst = [_]u32{before};
         const paint: SmPaint = .{ .shader = .{ .solid = single_src }, .style = .fill, .blend_mode = mode };
         dispatchSolid(single_dst[0..1], &paint, ct);
-        dst[i] = single_dst[0];
+        dst[i] = if (cov == 255) single_dst[0] else lerpU32(before, single_dst[0], cov);
     }
+}
+
+fn lerpU32(a: u32, b: u32, t: u8) u32 {
+    var out: u32 = 0;
+    inline for (0..4) |ch| {
+        const shift: u5 = @intCast(ch * 8);
+        const av: u32 = (a >> shift) & 0xFF;
+        const bv: u32 = (b >> shift) & 0xFF;
+        const v = (av * (255 - @as(u32, t)) + bv * @as(u32, t) + 127) / 255;
+        out |= v << shift;
+    }
+    return out;
 }
 
 test "resolveSolid forwards the solid color unchanged" {

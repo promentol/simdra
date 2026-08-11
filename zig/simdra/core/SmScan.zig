@@ -488,6 +488,7 @@ pub fn fillPathToCoverage(
     canvas_h: u32,
     path: *const SmPath,
     fill_rule: FillRule,
+    antialias: bool,
 ) !void {
     if (path.verbs.len == 0) return;
     if (canvas_w == 0 or canvas_h == 0) return;
@@ -502,7 +503,7 @@ pub fn fillPathToCoverage(
     defer allocator.free(cov_row);
 
     try sweepEdgesToCoverageMask(
-        &edges, allocator, mask, canvas_w, canvas_h, fill_rule, aa_accum, cov_row,
+        &edges, allocator, mask, canvas_w, canvas_h, fill_rule, aa_accum, cov_row, antialias,
     );
 }
 
@@ -520,6 +521,20 @@ const aa_sub_weight: f32 = 1.0 / @as(f32, @floatFromInt(aa_sub_count));
 /// the analytic overlap length (analytic-x partial coverage). After all 8
 /// sub-samples the accumulator holds the box-filtered pixel coverage in
 /// `[0, 1]` — quantized to a u8 row before being fed to `SmBlitter.blitRow`.
+/// depositSpanPoint — the ONE-SAMPLE rule: a pixel is in or out by
+/// whether its CENTRE lies in the span. Flash's "low" quality rasterizes
+/// this way, and a reference image taken that way has no partial pixels
+/// at all — approximating it by thresholding area coverage is not the
+/// same thing, because the area is itself quantized to the sub-sample
+/// grid.
+inline fn depositSpanPoint(accum: []f32, x_lo: f64, x_hi: f64, cw: i32) void {
+    const first_f = @ceil(x_lo - 0.5);
+    const last_f = @ceil(x_hi - 0.5) - 1.0;
+    var i: i32 = @max(0, @as(i32, @intFromFloat(first_f)));
+    const last: i32 = @min(cw - 1, @as(i32, @intFromFloat(last_f)));
+    while (i <= last) : (i += 1) accum[@intCast(i)] = 1.0;
+}
+
 inline fn depositSpan(accum: []f32, x_lo: f64, x_hi: f64, weight: f32, cw: i32) void {
     const cw_f: f64 = @floatFromInt(cw);
     const x_lo_c: f64 = @max(0.0, x_lo);
@@ -640,10 +655,13 @@ fn sweepEdges(
         var row_x_max: i32 = 0;
 
         // 4. Sub-y supersample sweep.
+        const sub_count: u32 = if (paint.antialias) aa_sub_count else 1;
         var s: u32 = 0;
-        while (s < aa_sub_count) : (s += 1) {
-            const y_sub: f64 = y_top + (@as(f64, @floatFromInt(s)) + 0.5) /
-                @as(f64, @floatFromInt(aa_sub_count));
+        while (s < sub_count) : (s += 1) {
+            const y_sub: f64 = if (paint.antialias)
+                y_top + (@as(f64, @floatFromInt(s)) + 0.5) / @as(f64, @floatFromInt(aa_sub_count))
+            else
+                y_top + 0.5;
 
             // Build (x, dir) list of edges live at this sub-y.
             sub_list.len = 0;
@@ -665,7 +683,10 @@ fn sweepEdges(
                 if (!prev_inside and new_inside) {
                     span_lo = se.x;
                 } else if (prev_inside and !new_inside) {
-                    depositSpan(aa_accum, span_lo, se.x, aa_sub_weight, cw_i);
+                    if (paint.antialias)
+                        depositSpan(aa_accum, span_lo, se.x, aa_sub_weight, cw_i)
+                    else
+                        depositSpanPoint(aa_accum, span_lo, se.x, cw_i);
                     const lo_i: i32 = @max(0, @as(i32, @intFromFloat(@floor(span_lo))));
                     const hi_i: i32 = @min(cw_i, @as(i32, @intFromFloat(@ceil(se.x))));
                     if (lo_i < row_x_min) row_x_min = lo_i;
@@ -684,6 +705,10 @@ fn sweepEdges(
             const run_start = x;
             while (x < row_x_max and aa_accum[@intCast(x)] * 256.0 >= 1.0) : (x += 1) {
                 const v = aa_accum[@intCast(x)] * 256.0;
+                if (!paint.antialias) {
+                    cov_row[@intCast(x)] = if (v >= 128.0) 255 else 0;
+                    continue;
+                }
                 cov_row[@intCast(x)] = if (v >= 255.0) 255 else @intFromFloat(v);
             }
             const n: u32 = @intCast(x - run_start);
@@ -719,6 +744,7 @@ fn sweepEdgesToCoverageMask(
     fill_rule: FillRule,
     aa_accum: []f32,
     cov_row: []u8,
+    antialias: bool,
 ) !void {
     if (edges.len == 0) return;
     if (aa_accum.len < canvas_w or cov_row.len < canvas_w) return;
@@ -819,7 +845,9 @@ fn sweepEdgesToCoverageMask(
         while (x < row_x_max) : (x += 1) {
             const v = aa_accum[@intCast(x)] * 256.0;
             const cov_byte: u8 = if (v >= 255.0) 255 else if (v <= 0.0) 0 else @intFromFloat(v);
-            mask[row_off + @as(usize, @intCast(x))] = cov_byte;
+            mask[row_off + @as(usize, @intCast(x))] = if (antialias)
+                cov_byte
+            else if (cov_byte >= 128) 255 else 0;
         }
     }
 }
@@ -1071,22 +1099,26 @@ fn strokePolyline(
                 const sum = v2add(np, nn);
                 const miter = v2scale(sum, 1.0 / safe_denom);
 
-                if (cross > 0) {
-                    // CCW turn → outer = left.
+                // Which side is OUTER follows the turn: with
+                // `perp(d) = (-d.y, d.x)`, the +perp ('left') side is the
+                // outer one when the cross product is NEGATIVE. The arc
+                // has to sweep the SHORT way round, so its direction
+                // flips with the side — getting one without the other
+                // spirals the outline and the polygon stops closing.
+                if (cross < 0) {
                     try left_pts.append(allocator, v2add(pts[i], np));
                     if (line_join == .round) {
-                        try emitArcFan(&left_pts, allocator, pts[i], np, nn, half_w, 1.0);
+                        try emitArcFan(&left_pts, allocator, pts[i], np, nn, half_w, -1.0);
                     }
                     try left_pts.append(allocator, v2add(pts[i], nn));
                     try right_pts.append(allocator, v2add(pts[i], v2scale(miter, -1)));
                 } else {
-                    // CW turn → outer = right.
                     try left_pts.append(allocator, v2add(pts[i], miter));
                     const np_neg: Vec2 = .{ .x = -np.x, .y = -np.y };
                     const nn_neg: Vec2 = .{ .x = -nn.x, .y = -nn.y };
                     try right_pts.append(allocator, v2add(pts[i], np_neg));
                     if (line_join == .round) {
-                        try emitArcFan(&right_pts, allocator, pts[i], np_neg, nn_neg, half_w, -1.0);
+                        try emitArcFan(&right_pts, allocator, pts[i], np_neg, nn_neg, half_w, 1.0);
                     }
                     try right_pts.append(allocator, v2add(pts[i], nn_neg));
                 }

@@ -1418,14 +1418,30 @@ fn emitArcFan(
 fn strokePolyline(
     edges: *EdgeBuf,
     allocator: std.mem.Allocator,
-    pts: []const Vec2,
+    pts_in: []const Vec2,
     half_w: f64,
     miter_limit: f64,
     line_cap: SmPaint.LineCap,
     line_join: SmPaint.LineJoin,
     closed: bool,
 ) !void {
-    if (pts.len < 2 or half_w <= 0) return;
+    if (pts_in.len < 2 or half_w <= 0) return;
+
+    // A zero-length segment has no direction, and a join against one has
+    // no angle: the miter math ran away with it (a hairline on a Flash
+    // morph shape reached 45 px past its geometry). Repeated points are
+    // dropped first — lyon, Ruffle's stroker, does the same — so every
+    // join sees two real directions and the miter limit means what it
+    // says. A closed ring that ends where it starts loses the duplicate.
+    var kept: PointBuf = .{};
+    defer kept.deinit(allocator);
+    for (pts_in) |p| {
+        if (kept.len > 0 and v2lenSq(v2sub(p, kept.ptr[kept.len - 1])) < 1e-12) continue;
+        try kept.append(allocator, p);
+    }
+    if (closed and kept.len > 1 and v2lenSq(v2sub(kept.ptr[0], kept.ptr[kept.len - 1])) < 1e-12) kept.len -= 1;
+    const pts: []const Vec2 = kept.ptr[0..kept.len];
+    if (pts.len < 2) return;
     const n = pts.len;
 
     // Threshold on (1 + cos θ) below which we bevel instead of miter.
@@ -2089,4 +2105,56 @@ test "coverage goldens and the analytic tolerance: 32 seeded paths through fillP
     try std.testing.expect(mean <= tol_mean_max);
     try std.testing.expect(p999 <= tol_p999_max);
     try std.testing.expect(max_rect <= tol_rect_max);
+}
+
+test "stroke: repeated points change nothing, and a hairline with a zero-length segment stays within its miter reach" {
+    const a = std.testing.allocator;
+    const W: u32 = 96;
+    const H: u32 = 64;
+    const pixels = try a.alloc(u32, W * H);
+    defer a.free(pixels);
+    const ref = try a.alloc(u32, W * H);
+    defer a.free(ref);
+    const accum = try a.alloc(f32, W + accum_slack);
+    defer a.free(accum);
+    const cov = try a.alloc(u8, W);
+    defer a.free(cov);
+    const paint: SmPaint = .{ .shader = .{ .solid = 0xFF2040E0 }, .style = .stroke, .stroke_width = 1.0, .blend_mode = .src_over };
+
+    // The same polyline with and without a repeated vertex.
+    var clean = SmPath.emptyWithAllocator(a);
+    defer clean.deinit();
+    clean.moveTo(10, 40);
+    clean.lineTo(50, 12);
+    clean.lineTo(80, 50);
+    var dup = SmPath.emptyWithAllocator(a);
+    defer dup.deinit();
+    dup.moveTo(10, 40);
+    dup.lineTo(50, 12);
+    dup.lineTo(50, 12);
+    dup.lineTo(80, 50);
+    @memset(ref, 0);
+    try strokePath(a, ref, W, H, &clean, 1.0, .round, .round, 10.0, &.{}, 0, null, &paint, accum, cov);
+    @memset(pixels, 0);
+    try strokePath(a, pixels, W, H, &dup, 1.0, .round, .round, 10.0, &.{}, 0, null, &paint, accum, cov);
+    try std.testing.expectEqualSlices(u32, ref, pixels);
+
+    // Every painted pixel lies within the points' box plus the reach a
+    // hairline's miter may have (half a pixel times the default limit).
+    var x_min: u32 = W;
+    var x_max: u32 = 0;
+    var y_min: u32 = H;
+    var y_max: u32 = 0;
+    for (pixels, 0..) |p, i| {
+        if (p == 0) continue;
+        const x: u32 = @intCast(i % W);
+        const y: u32 = @intCast(i / W);
+        x_min = @min(x_min, x);
+        x_max = @max(x_max, x);
+        y_min = @min(y_min, y);
+        y_max = @max(y_max, y);
+    }
+    const reach: u32 = 6;
+    try std.testing.expect(x_min + reach >= 10 and x_max <= 80 + reach);
+    try std.testing.expect(y_min + reach >= 12 and y_max <= 50 + reach);
 }

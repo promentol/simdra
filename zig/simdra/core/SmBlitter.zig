@@ -97,17 +97,21 @@ pub fn blitRow(
             }
             return;
         }
-        // Build effective coverage. Allocates a small per-row scratch via
-        // page_allocator — cheap relative to the per-pixel blend cost; can
-        // be replaced with a per-canvas scratch buffer later.
-        const allocator = std.heap.page_allocator;
-        const eff = allocator.alloc(u8, n) catch return;
-        defer allocator.free(eff);
+        // Build effective coverage in a STACK scratch. The previous
+        // page_allocator alloc/free per run cost a mmap/munmap pair each —
+        // 1,900 pairs per frame on a masked Flash screen, a third of the
+        // frame's samples in the kernel. 4096 covers any row a handheld
+        // stage has; wider rows fall back to the heap, never truncate.
+        var stack: [4096]u8 = undefined;
+        const on_heap = n > stack.len;
+        const eff: []u8 = if (on_heap)
+            std.heap.page_allocator.alloc(u8, n) catch return
+        else
+            stack[0..n];
+        defer if (on_heap) std.heap.page_allocator.free(eff);
         if (coverage) |cov| {
             std.debug.assert(cov.len == n);
-            for (0..n) |i| {
-                eff[i] = @intCast((@as(u16, cov[i]) * @as(u16, cr[i]) + 127) / 255);
-            }
+            simd.clipCombineU8(eff, cov, cr);
         } else {
             @memcpy(eff, cr);
         }

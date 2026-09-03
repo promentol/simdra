@@ -356,15 +356,16 @@ fn sortSubEdgesByX(xs: []SubEdge) void {
 /// generation; lets the main sweep walk a `next_idx` cursor instead of
 /// re-checking every edge per scanline.
 fn sortEdgesByYMin(edges: []Edge) void {
-    var i: usize = 1;
-    while (i < edges.len) : (i += 1) {
-        const key = edges[i];
-        var j: usize = i;
-        while (j > 0 and edges[j - 1].y_min > key.y_min) : (j -= 1) {
-            edges[j] = edges[j - 1];
+    // pdq: the flattener emits edges in path order, which is nowhere near
+    // sorted by y, and the old insertion sort was O(N²) on every sweep —
+    // a thousand-edge glyph paid ~250k struct moves before touching a
+    // pixel. Equal y_min order is irrelevant downstream: the sub-scanline
+    // walk re-sorts by x, and the analytic converter's deposits commute.
+    std.sort.pdq(Edge, edges, {}, struct {
+        fn lt(_: void, a: Edge, b: Edge) bool {
+            return a.y_min < b.y_min;
         }
-        edges[j] = key;
-    }
+    }.lt);
 }
 
 /// flattenPathToFillEdges — populate `edges` with the line-segment edges
@@ -608,6 +609,12 @@ fn sweepEdges(
     const y_end: i32 = @min(ch_i, @as(i32, @intFromFloat(@ceil(y_max_total))));
     if (y_start >= y_end) return;
 
+    // The accumulator is cleared ONCE here and then only over the range a
+    // row actually touched (tracked as row_x_min/row_x_max below). The old
+    // per-row full-width memset was 17 % of a Flash frame on a Cortex-A53
+    // — 4·W bytes per scanline for shapes that touch a dozen pixels.
+    @memset(aa_accum[0..canvas_w], 0.0);
+
     var active: ActiveBuf = .{};
     defer active.deinit(allocator);
     var sub_list: SubEdgeBuf = .{};
@@ -647,10 +654,10 @@ fn sweepEdges(
 
         if (active.len < 2) continue;
 
-        // 3. Zero the accumulator over the canvas-width range. The cov_row
-        // is written only inside non-zero runs below, so it doesn't need
-        // pre-zeroing — the blitter only reads the slice we hand it.
-        @memset(aa_accum[0..canvas_w], 0.0);
+        // 3. The accumulator is already zero (entry clear + the range clear
+        // at the end of every row). The cov_row is written only inside
+        // non-zero runs below, so it needs no pre-zeroing either — the
+        // blitter only reads the slice we hand it.
         var row_x_min: i32 = cw_i;
         var row_x_max: i32 = 0;
 
@@ -723,6 +730,10 @@ fn sweepEdges(
                 clip_mask,
             );
         }
+        // 6. Clear only what this row touched: every deposit lands inside
+        // [row_x_min, row_x_max) (depositSpan clamps to the same bounds the
+        // range is built from), so the rest of the row is still zero.
+        @memset(aa_accum[@intCast(row_x_min)..@intCast(row_x_max)], 0.0);
     }
 }
 
@@ -764,6 +775,9 @@ fn sweepEdgesToCoverageMask(
     const y_end: i32 = @min(ch_i, @as(i32, @intFromFloat(@ceil(y_max_total))));
     if (y_start >= y_end) return;
 
+    // Cleared once, then only over each row's touched range (see sweepEdges).
+    @memset(aa_accum[0..canvas_w], 0.0);
+
     var active: ActiveBuf = .{};
     defer active.deinit(allocator);
     var sub_list: SubEdgeBuf = .{};
@@ -801,7 +815,6 @@ fn sweepEdgesToCoverageMask(
 
         if (active.len < 2) continue;
 
-        @memset(aa_accum[0..canvas_w], 0.0);
         var row_x_min: i32 = cw_i;
         var row_x_max: i32 = 0;
 
@@ -849,6 +862,7 @@ fn sweepEdgesToCoverageMask(
                 cov_byte
             else if (cov_byte >= 128) 255 else 0;
         }
+        @memset(aa_accum[@intCast(row_x_min)..@intCast(row_x_max)], 0.0);
     }
 }
 
@@ -1504,4 +1518,84 @@ pub fn strokePath(
     // rule (the donut is built CCW outer + CW inner) — fill rule is not
     // user-controllable for strokes.
     try sweepEdges(&edges, allocator, pixels, canvas_w, canvas_h, .nonzero, clip_mask, paint, aa_accum, cov_row);
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+/// The 32 seeded paths every scan-converter test draws: lines, quads,
+/// cubics and rects with coordinates that run past the canvas on every
+/// side, half nonzero / half even-odd, one in four without antialiasing.
+/// Deterministic, so the same paths pin a golden hash across changes that
+/// must not move a byte, and feed the analytic-vs-supersample comparison.
+fn testPath(allocator: std.mem.Allocator, r: std.Random, i: usize) !SmPath {
+    var path = SmPath.emptyWithAllocator(allocator);
+    errdefer path.deinit();
+    const span: f64 = 112.0;
+    const off: f64 = -8.0;
+    const rnd = struct {
+        fn c(rr: std.Random, sp: f64, o: f64) f64 {
+            return o + rr.float(f64) * sp;
+        }
+    };
+    if (i % 5 == 4) {
+        path.rect(rnd.c(r, span, off), rnd.c(r, span, off), 4 + r.float(f64) * 60, 4 + r.float(f64) * 40);
+        return path;
+    }
+    path.moveTo(rnd.c(r, span, off), rnd.c(r, span, off));
+    const segs = 3 + r.uintLessThan(usize, 6);
+    var k: usize = 0;
+    while (k < segs) : (k += 1) {
+        switch (r.uintLessThan(u8, 3)) {
+            0 => path.lineTo(rnd.c(r, span, off), rnd.c(r, span, off)),
+            1 => path.quadraticCurveTo(rnd.c(r, span, off), rnd.c(r, span, off), rnd.c(r, span, off), rnd.c(r, span, off)),
+            else => path.bezierCurveTo(rnd.c(r, span, off), rnd.c(r, span, off), rnd.c(r, span, off), rnd.c(r, span, off), rnd.c(r, span, off), rnd.c(r, span, off)),
+        }
+    }
+    path.closePath();
+    return path;
+}
+
+/// The golden: a Wyhash over the pixels of `fillPath` and the mask of
+/// `fillPathToCoverage` for the 32 test paths. Changes that promise not
+/// to move a byte (range-clearing the accumulator, the sort) keep it;
+/// the analytic converter replaces it with a measured tolerance.
+const golden_supersample8: u64 = 0x82e80ad2a7f05938;
+
+test "coverage goldens: 32 seeded paths through fillPath and fillPathToCoverage" {
+    const a = std.testing.allocator;
+    const W: u32 = 96;
+    const H: u32 = 64;
+    var prng = std.Random.DefaultPrng.init(0x5eed_c0de);
+    const r = prng.random();
+    const pixels = try a.alloc(u32, W * H);
+    defer a.free(pixels);
+    const mask = try a.alloc(u8, W * H);
+    defer a.free(mask);
+    const accum = try a.alloc(f32, W);
+    defer a.free(accum);
+    const cov = try a.alloc(u8, W);
+    defer a.free(cov);
+    var hasher = std.hash.Wyhash.init(0);
+    var i: usize = 0;
+    while (i < 32) : (i += 1) {
+        var path = try testPath(a, r, i);
+        defer path.deinit();
+        const rule: FillRule = if (i & 1 == 0) .nonzero else .evenodd;
+        const aa = (i % 4) != 3;
+        @memset(pixels, 0xFF202020);
+        const paint: SmPaint = .{ .shader = .{ .solid = 0xFFE0A040 }, .style = .fill, .blend_mode = .src_over, .antialias = aa };
+        try fillPath(a, pixels, W, H, &path, rule, null, &paint, accum, cov);
+        hasher.update(std.mem.sliceAsBytes(pixels));
+        @memset(mask, 0);
+        try fillPathToCoverage(a, mask, W, H, &path, rule, aa);
+        hasher.update(mask);
+    }
+    const h = hasher.final();
+    if (golden_supersample8 == 0) {
+        std.debug.print("\ngolden_supersample8 = 0x{x}\n", .{h});
+    } else {
+        try std.testing.expectEqual(golden_supersample8, h);
+    }
 }

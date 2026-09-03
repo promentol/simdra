@@ -25,6 +25,28 @@ pub fn fillU32(dst: []u32, value: u32) void {
     }
 }
 
+/// `dst[i] = (a[i] * b[i] + 127) / 255` — the clip-mask combine: a
+/// coverage row multiplied by a clip row, both u8. Sixteen lanes in u16
+/// (max product 65025 + 127 fits), the exact `/255` as
+/// `(t + 1 + (t >> 8)) >> 8`, which equals integer division for every
+/// t <= 65534 (checked exhaustively in the tolerance test).
+pub fn clipCombineU8(dst: []u8, a: []const u8, b: []const u8) void {
+    std.debug.assert(dst.len == a.len and dst.len == b.len);
+    const N = 16;
+    const V = @Vector(N, u16);
+    var i: usize = 0;
+    while (i + N <= dst.len) : (i += N) {
+        const av: V = @as(@Vector(N, u8), a[i..][0..N].*);
+        const bv: V = @as(@Vector(N, u8), b[i..][0..N].*);
+        const t: V = av * bv + @as(V, @splat(127));
+        const q: V = (t + @as(V, @splat(1)) + (t >> @splat(8))) >> @splat(8);
+        dst[i..][0..N].* = @as(@Vector(N, u8), @intCast(q));
+    }
+    while (i < dst.len) : (i += 1) {
+        dst[i] = @intCast((@as(u16, a[i]) * @as(u16, b[i]) + 127) / 255);
+    }
+}
+
 pub fn copyU32(dst: []u32, src: []const u32) void {
     std.debug.assert(dst.len == src.len);
     var i: usize = 0;

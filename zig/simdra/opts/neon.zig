@@ -83,6 +83,7 @@ pub const SrcOverChunkPixels = generic.SrcOverChunkPixels;
 
 pub const fillU32 = generic.fillU32;
 pub const copyU32 = generic.copyU32;
+pub const clipCombineU8 = generic.clipCombineU8;
 pub const blendSrcOverU32 = generic.blendSrcOverU32;
 pub const blendSrcOverCovU32 = generic.blendSrcOverCovU32;
 pub const blendAddU32 = generic.blendAddU32;

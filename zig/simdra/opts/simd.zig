@@ -35,6 +35,7 @@ pub const SrcOverChunkPixels = backend.SrcOverChunkPixels;
 
 pub const fillU32 = backend.fillU32;
 pub const copyU32 = backend.copyU32;
+pub const clipCombineU8 = backend.clipCombineU8;
 pub const copyU32ToFloat16Norm = backend.copyU32ToFloat16Norm;
 pub const blendSrcOverU32 = backend.blendSrcOverU32;
 pub const blendSrcOverCovU32 = backend.blendSrcOverCovU32;

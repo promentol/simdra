@@ -343,16 +343,18 @@ inline fn lookup4(self: *const SmGradient, tc: V4, out: []u32) void {
     inline for (0..4) |k| out[k] = self.colorAtFolded(ta[k]);
 }
 
-/// Colours along a row whose parameter is `t0 + i * dt`.
-fn rowFromAffine(self: *const SmGradient, t0: f64, dt: f64, out: []u32) void {
-    const lane: V4 = .{ 0, 1, 2, 3 };
-    const dt4 = splat4(@floatCast(dt));
+/// Colours along a row whose parameter at pixel centre x is
+/// `k1 · x + k2`, each lane evaluated in f64 from its ABSOLUTE column
+/// (`x_start + i` is exact) so that the row is a function of the pixel
+/// alone — a run split or trimmed anywhere gives the same bytes.
+fn rowFromAffine(self: *const SmGradient, x_start: f64, k1: f64, k2: f64, out: []u32) void {
     var i: usize = 0;
     while (i + 4 <= out.len) : (i += 4) {
-        const base: f32 = @floatCast(t0 + @as(f64, @floatFromInt(i)) * dt);
-        self.lookup4(self.fold4(splat4(base) + lane * dt4), out[i..][0..4]);
+        var t4: V4 = undefined;
+        inline for (0..4) |k| t4[k] = @floatCast(k1 * (x_start + @as(f64, @floatFromInt(i + k))) + k2);
+        self.lookup4(self.fold4(t4), out[i..][0..4]);
     }
-    while (i < out.len) : (i += 1) out[i] = self.colorAt(t0 + @as(f64, @floatFromInt(i)) * dt);
+    while (i < out.len) : (i += 1) out[i] = self.colorAt(k1 * (x_start + @as(f64, @floatFromInt(i))) + k2);
 }
 
 /// sampleLinearRow — `out[i]` = the colour at (x_start + i, y).
@@ -365,8 +367,8 @@ pub fn sampleLinearRow(self: *const SmGradient, x_start: f64, y: f64, out: []u32
         @memset(out, self.colorAt(0));
         return;
     }
-    const t0 = ((x_start - lin.x0) * dx + (y - lin.y0) * dy) / len_sq;
-    self.rowFromAffine(t0, dx / len_sq, out);
+    // t(x) = (dx · x + (dy · (y - y0) - dx · x0)) / len_sq.
+    self.rowFromAffine(x_start, dx / len_sq, ((y - lin.y0) * dy - lin.x0 * dx) / len_sq, out);
 }
 
 /// sampleRadialRow — `out[i]` = the colour at (x_start + i, y), the
@@ -390,10 +392,11 @@ pub fn sampleRadialRow(self: *const SmGradient, x_start: f64, y: f64, out: []u32
     const r04 = splat4(@floatCast(rad.r0));
     const four_a = splat4(@floatCast(4.0 * A));
     const inv_2a = splat4(@floatCast(1.0 / (2.0 * A)));
-    const lane: V4 = .{ 0, 1, 2, 3 };
     var i: usize = 0;
     while (i + 4 <= out.len) : (i += 4) {
-        const dx = splat4(@floatCast(x_start - rad.x0 + @as(f64, @floatFromInt(i)))) + lane;
+        // Each lane from its absolute column (see rowFromAffine).
+        var dx: V4 = undefined;
+        inline for (0..4) |k| dx[k] = @floatCast((x_start + @as(f64, @floatFromInt(i + k))) - rad.x0);
         const B = splat4(-2.0) * (dx * cdx4 + splat4(b_const));
         const C = dx * dx + splat4(c_const);
         const disc = B * B - four_a * C;

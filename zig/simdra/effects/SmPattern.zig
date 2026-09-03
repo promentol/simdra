@@ -148,17 +148,22 @@ pub fn sampleRow(self: *const SmPattern, x_start: f64, y: f64, out: []u32) void 
         @memset(out, 0);
         return;
     }
-    const p0 = self.inv_transform.applyToPoint(x_start, y);
-    const p1 = self.inv_transform.applyToPoint(x_start + 1.0, y);
-    const dsx = p1[0] - p0[0];
-    const dsy = p1[1] - p0[1];
-    if (!std.math.isFinite(p0[0]) or !std.math.isFinite(p0[1]) or !std.math.isFinite(dsx) or !std.math.isFinite(dsy)) {
+    // Every pixel is a function of its ABSOLUTE column: `x_start` is a
+    // pixel centre (X + 0.5, exact), `x_start + i` is exact, and the
+    // texel coordinate u(x) = a·x + (c·y + e) is evaluated from it —
+    // never stepped from the run's first pixel. So a run split, trimmed
+    // or started anywhere samples the bytes of the same pixels (a
+    // partial repaint, a cached span replayed under a clip).
+    const m = &self.inv_transform;
+    const cy_e = m.c * y + m.e;
+    const dy_f = m.d * y + m.f;
+    if (!std.math.isFinite(m.a) or !std.math.isFinite(m.b) or !std.math.isFinite(cy_e) or !std.math.isFinite(dy_f) or !std.math.isFinite(x_start)) {
         @memset(out, 0);
         return;
     }
     switch (self.filter) {
-        .nearest => self.sampleNearestRow(p0[0], p0[1], dsx, dsy, out),
-        .bilinear => self.sampleBilinearRow(p0[0], p0[1], dsx, dsy, out),
+        .nearest => self.sampleNearestRow(x_start, m.a, m.b, cy_e, dy_f, out),
+        .bilinear => self.sampleBilinearRow(x_start, m.a, m.b, cy_e, dy_f, out),
     }
 }
 
@@ -177,6 +182,35 @@ const Axis4 = struct {
     du: i64,
     n: i64,
     tiled: bool,
+
+    /// The axis anchored at column 0: `u0` is the texel coordinate at
+    /// pixel centre x = 0.5, `du` the step per pixel, and the run
+    /// starts at column `x0`, so its base is `fx(u0) + x0 · fx(du)` in
+    /// integer arithmetic — the same number whichever run column `x0`
+    /// happens to be, which is what makes a row a function of the
+    /// pixel alone. Null when the fixed point cannot hold it (the
+    /// caller samples per pixel in f64, deterministically too).
+    fn initAt(u_zero: f64, du: f64, x0: i64, n: u32, tiled: bool) ?Axis4 {
+        const nf: f64 = @floatFromInt(n);
+        var u = u_zero;
+        var d = du;
+        if (tiled) {
+            u = @mod(u_zero, nf);
+            if (u < 0 or u >= nf) u = 0;
+            d = @mod(du, nf);
+            if (d < 0 or d >= nf) d = 0;
+        } else if (@abs(u_zero) > 1.0e9 or @abs(du) > 1.0e9) {
+            return null;
+        }
+        const n_fx: i64 = @as(i64, n) * one;
+        var base: i128 = @as(i128, fx(u)) + @as(i128, x0) * @as(i128, fx(d));
+        if (tiled) {
+            base = @mod(base, @as(i128, n_fx));
+        } else if (base > (1 << 62) or base < -(1 << 62)) {
+            return null;
+        }
+        return .{ .base = @intCast(base), .du = fx(d), .n = n_fx, .tiled = tiled };
+    }
 
     /// Null when the coordinates are too large for the fixed point (a
     /// non-tiled axis a billion texels out — the caller falls back).
@@ -221,17 +255,21 @@ const Axis4 = struct {
     }
 };
 
-fn sampleNearestRow(self: *const SmPattern, sx0: f64, sy0: f64, dsx: f64, dsy: f64, out: []u32) void {
+fn sampleNearestRow(self: *const SmPattern, x_start: f64, ka: f64, kb: f64, cy_e: f64, dy_f: f64, out: []u32) void {
     const tile_x = self.repetition == .repeat or self.repetition == .repeat_x;
     const tile_y = self.repetition == .repeat or self.repetition == .repeat_y;
-    var ax = Axis4.init(sx0, dsx, self.width, tile_x) orelse return self.sampleNearestRowScalar(sx0, sy0, dsx, dsy, out);
-    var ay = Axis4.init(sy0, dsy, self.height, tile_y) orelse return self.sampleNearestRowScalar(sx0, sy0, dsx, dsy, out);
+    const x0: i64 = @intFromFloat(@floor(x_start));
+    var ax = Axis4.initAt(ka * 0.5 + cy_e, ka, x0, self.width, tile_x) orelse return self.sampleNearestRowScalar(x_start, ka, kb, cy_e, dy_f, out);
+    var ay = Axis4.initAt(kb * 0.5 + dy_f, kb, x0, self.height, tile_y) orelse return self.sampleNearestRowScalar(x_start, ka, kb, cy_e, dy_f, out);
     const w: usize = self.width;
     var i: usize = 0;
-    while (i + 4 <= out.len) : (i += 4) {
+    // The tail takes the same fixed-point lanes as the body (a pixel
+    // must not sample differently for being last in its run).
+    while (i < out.len) : (i += 4) {
         const xi: [4]i64 = ax.next4();
         const yi: [4]i64 = ay.next4();
-        inline for (0..4) |k| {
+        const n = @min(4, out.len - i);
+        for (0..n) |k| {
             if (xi[k] < 0 or yi[k] < 0) {
                 out[i + k] = 0;
             } else {
@@ -240,31 +278,27 @@ fn sampleNearestRow(self: *const SmPattern, sx0: f64, sy0: f64, dsx: f64, dsy: f
             }
         }
     }
-    while (i < out.len) : (i += 1) {
-        const fi: f64 = @floatFromInt(i);
-        out[i] = self.sampleNearest(sx0 + fi * dsx, sy0 + fi * dsy);
-    }
 }
 
-fn sampleNearestRowScalar(self: *const SmPattern, sx0: f64, sy0: f64, dsx: f64, dsy: f64, out: []u32) void {
+fn sampleNearestRowScalar(self: *const SmPattern, x_start: f64, ka: f64, kb: f64, cy_e: f64, dy_f: f64, out: []u32) void {
     for (out, 0..) |*o, i| {
-        const fi: f64 = @floatFromInt(i);
-        o.* = self.sampleNearest(sx0 + fi * dsx, sy0 + fi * dsy);
+        const x = x_start + @as(f64, @floatFromInt(i));
+        o.* = self.sampleNearest(ka * x + cy_e, kb * x + dy_f);
     }
 }
 
-fn sampleBilinearRow(self: *const SmPattern, sx0: f64, sy0: f64, dsx: f64, dsy: f64, out: []u32) void {
+fn sampleBilinearRow(self: *const SmPattern, x_start: f64, ka: f64, kb: f64, cy_e: f64, dy_f: f64, out: []u32) void {
     const tile_x = self.repetition == .repeat or self.repetition == .repeat_x;
     const tile_y = self.repetition == .repeat or self.repetition == .repeat_y;
     const w_i: i64 = @intCast(self.width);
     const h_i: i64 = @intCast(self.height);
     const w: usize = self.width;
     for (out, 0..) |*o, i| {
-        // Each pixel from the row base (no serial chain); the -0.5 puts
-        // texel centres at integer offsets (see sampleBilinear).
-        const fi: f64 = @floatFromInt(i);
-        const u = sx0 - 0.5 + fi * dsx;
-        const v = sy0 - 0.5 + fi * dsy;
+        // Each pixel from its absolute column; the -0.5 puts texel
+        // centres at integer offsets (see sampleBilinear).
+        const x = x_start + @as(f64, @floatFromInt(i));
+        const u = ka * x + cy_e - 0.5;
+        const v = kb * x + dy_f - 0.5;
         const ufl = @floor(u);
         const vfl = @floor(v);
         const fx: f32 = @floatCast(u - ufl);

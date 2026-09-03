@@ -115,7 +115,7 @@ pub fn blitRow(
     switch (paint.shader) {
         .solid => {},
         .gradient, .pattern => {
-            dispatchShader(row, x_start, y, coverage, paint, clip_row, x_in, n_in);
+            dispatchShader(row, x_start, y, coverage, paint, clip_row);
             return;
         },
     }
@@ -192,52 +192,35 @@ inline fn dispatchShader(
     coverage: ?[]const u8,
     paint: *const SmPaint,
     clip_row: ?[]const u8,
-    /// The run as the scan converter emitted it, before the clip box
-    /// trimmed it to `row` (`full_x <= x_start`, `full_n >= row.len`).
-    full_x: i32,
-    full_n: u32,
 ) void {
     // Sample the shader into a source row, modulate it once, blend the
     // row with ONE kernel call. The per-pixel version this replaced
     // (`dispatchShaderReference`, kept for the test) built a one-pixel
     // paint and ran the 27-way blend switch for every pixel.
     //
-    // The sampling walks the UNTRIMMED run: the row samplers step in f32
-    // lanes from the run's first pixel, so where a run starts decides
-    // the last bit of every pixel in it, and a run trimmed by a clip box
-    // has to yield the same bytes inside the box as the same run
-    // unclipped (a partial repaint under a box clip must be invisible).
+    // Only the visible run is sampled: the row samplers evaluate every
+    // pixel from its absolute column (SmPattern / SmGradient
+    // `sampleRow`), so where a run starts or ends does not change a
+    // byte inside it — a run trimmed by a clip box, or a cached span
+    // replayed in pieces, is the same pixels.
     const py: f64 = @as(f64, @floatFromInt(y)) + 0.5;
     var src_stack: [ROW_CHUNK]u32 = undefined;
     var keep_stack: [ROW_CHUNK]u8 = undefined;
-    const skip: usize = @intCast(x_start - full_x);
-    const vis_end: usize = skip + row.len;
     var off: usize = 0;
-    while (off < full_n) {
-        const n = @min(full_n - off, ROW_CHUNK);
-        const chunk_end = off + n;
-        if (chunk_end <= skip or off >= vis_end) {
-            off = chunk_end;
-            continue;
-        }
+    while (off < row.len) {
+        const n = @min(row.len - off, ROW_CHUNK);
         const src = src_stack[0..n];
-        const px0: f64 = @as(f64, @floatFromInt(full_x + @as(i32, @intCast(off)))) + 0.5;
+        const px0: f64 = @as(f64, @floatFromInt(x_start + @as(i32, @intCast(off)))) + 0.5;
         switch (paint.shader) {
             .gradient => |g| g.sampleRow(px0, py, src),
             .pattern => |pat| pat.sampleRow(px0, py, src),
             .solid => unreachable,
         }
-        // The visible part of this chunk, chunk-relative and row-relative.
-        const a = @max(off, skip) - off;
-        const b = @min(chunk_end, vis_end) - off;
-        const ra = off + a - skip;
-        const rb = off + b - skip;
-        const vis = src[a..b];
-        const cov_slice: ?[]const u8 = if (coverage) |c| c[ra..rb] else null;
-        const clip_slice: ?[]const u8 = if (clip_row) |c| c[ra..rb] else null;
-        prepareSourceRow(vis, keep_stack[0 .. b - a], vis, cov_slice, paint, clip_slice);
-        dispatchRowSrc(row[ra..rb], vis, if (clip_row != null) keep_stack[0 .. b - a] else null, paint.blend_mode, paint.dst_color_type);
-        off = chunk_end;
+        const cov_slice: ?[]const u8 = if (coverage) |c| c[off..][0..n] else null;
+        const clip_slice: ?[]const u8 = if (clip_row) |c| c[off..][0..n] else null;
+        prepareSourceRow(src, keep_stack[0..n], src, cov_slice, paint, clip_slice);
+        dispatchRowSrc(row[off..][0..n], src, if (clip_row != null) keep_stack[0..n] else null, paint.blend_mode, paint.dst_color_type);
+        off += n;
     }
 }
 
@@ -947,7 +930,7 @@ test "hoisted row dispatch == per-pixel reference (±1 LSB): every mode x covera
                 var p: SmPaint = .{ .shader = shader, .blend_mode = mode, .cxform = cxf, .global_alpha = ga, .dst_color_type = ct };
                 var a = dst_init;
                 var b = dst_init;
-                dispatchShader(&a, 3, 7, coverage, &p, clip_row, 3, N);
+                dispatchShader(&a, 3, 7, coverage, &p, clip_row);
                 dispatchShaderReference(&b, 3, 7, coverage, &p, clip_row);
                 try expectWithin1(&b, &a);
             }
@@ -988,7 +971,7 @@ test "hoisted row dispatch == per-pixel reference (±1 LSB): every mode x covera
     blitRowFromSourceReference(wide_ref, wide_src, &wp, wide_clip);
     try expectWithin1(wide_ref, wide_dst);
     @memcpy(wide_ref, wide_dst);
-    dispatchShader(wide_dst, -50, 2, wide_clip, &wp, null, -50, W);
+    dispatchShader(wide_dst, -50, 2, wide_clip, &wp, null);
     dispatchShaderReference(wide_ref, -50, 2, wide_clip, &wp, null);
     try expectWithin1(wide_ref, wide_dst);
 }

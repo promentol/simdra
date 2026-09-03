@@ -98,7 +98,6 @@ pub const Edge = struct {
 
 pub const EdgeBuf = SmList(Edge);
 
-
 /// Add a line segment to the edge list, dropping horizontal segments
 /// (no scanline contribution) and tracking direction for winding count.
 fn addEdge(edges: *EdgeBuf, allocator: std.mem.Allocator, x0: f64, y0: f64, x1: f64, y1: f64) !void {
@@ -146,9 +145,12 @@ fn isQuadFlat(p0x: f64, p0y: f64, cpx: f64, cpy: f64, p1x: f64, p1y: f64) bool {
 fn flattenQuad(
     edges: *EdgeBuf,
     allocator: std.mem.Allocator,
-    p0x: f64, p0y: f64,
-    cpx: f64, cpy: f64,
-    p1x: f64, p1y: f64,
+    p0x: f64,
+    p0y: f64,
+    cpx: f64,
+    cpy: f64,
+    p1x: f64,
+    p1y: f64,
     depth: u32,
 ) !void {
     if (depth >= 16 or isQuadFlat(p0x, p0y, cpx, cpy, p1x, p1y)) {
@@ -169,10 +171,14 @@ fn flattenQuad(
 /// True if cubic Bézier (p0, c1, c2, p1) is "flat enough". Both control
 /// points must be within tolerance of chord p0-p1.
 fn isCubicFlat(
-    p0x: f64, p0y: f64,
-    c1x: f64, c1y: f64,
-    c2x: f64, c2y: f64,
-    p1x: f64, p1y: f64,
+    p0x: f64,
+    p0y: f64,
+    c1x: f64,
+    c1y: f64,
+    c2x: f64,
+    c2y: f64,
+    p1x: f64,
+    p1y: f64,
 ) bool {
     const dx = p1x - p0x;
     const dy = p1y - p0y;
@@ -188,10 +194,14 @@ fn isCubicFlat(
 fn flattenCubic(
     edges: *EdgeBuf,
     allocator: std.mem.Allocator,
-    p0x: f64, p0y: f64,
-    c1x: f64, c1y: f64,
-    c2x: f64, c2y: f64,
-    p1x: f64, p1y: f64,
+    p0x: f64,
+    p0y: f64,
+    c1x: f64,
+    c1y: f64,
+    c2x: f64,
+    c2y: f64,
+    p1x: f64,
+    p1y: f64,
     depth: u32,
 ) !void {
     if (depth >= 18 or isCubicFlat(p0x, p0y, c1x, c1y, c2x, c2y, p1x, p1y)) {
@@ -234,17 +244,24 @@ fn walkOpcodes(verbs: []const u8, points: []const f64, visitor: anytype) !void {
             .move_to => try visitor.onMoveTo(points[pi], points[pi + 1]),
             .line_to => try visitor.onLineTo(points[pi], points[pi + 1]),
             .quad_to => try visitor.onQuadTo(
-                points[pi], points[pi + 1],
-                points[pi + 2], points[pi + 3],
+                points[pi],
+                points[pi + 1],
+                points[pi + 2],
+                points[pi + 3],
             ),
             .bezier_to => try visitor.onBezierTo(
-                points[pi], points[pi + 1],
-                points[pi + 2], points[pi + 3],
-                points[pi + 4], points[pi + 5],
+                points[pi],
+                points[pi + 1],
+                points[pi + 2],
+                points[pi + 3],
+                points[pi + 4],
+                points[pi + 5],
             ),
             .rect_path => try visitor.onRect(
-                points[pi], points[pi + 1],
-                points[pi + 2], points[pi + 3],
+                points[pi],
+                points[pi + 1],
+                points[pi + 2],
+                points[pi + 3],
             ),
         }
         pi += SmPath.floatCount(op);
@@ -426,7 +443,38 @@ pub fn fillPath(
     var edges: EdgeBuf = .{};
     defer edges.deinit(allocator);
     try flattenPathToFillEdges(allocator, path, &edges);
-    try sweepEdges(&edges, allocator, pixels, canvas_w, canvas_h, fill_rule, clip_mask, paint, aa_accum, cov_row);
+    try sweepFill(&edges, allocator, pixels, canvas_w, canvas_h, fill_rule, clip_mask, paint, aa_accum, cov_row);
+}
+
+/// Pick the converter: the analytic one for antialiased fills unless the
+/// paint asks for the supersampled sweep; one-sample-per-pixel fills
+/// keep the sweep (its centre-in-span rule is Flash's "low" quality,
+/// which no area-threshold reproduces).
+fn sweepFill(
+    edges: *EdgeBuf,
+    allocator: std.mem.Allocator,
+    pixels: []u32,
+    canvas_w: u32,
+    canvas_h: u32,
+    fill_rule: FillRule,
+    clip_mask: ?[]const u8,
+    paint: *const SmPaint,
+    aa_accum: []f32,
+    cov_row: []u8,
+) !void {
+    if (paint.antialias and paint.aa_mode == .analytic) {
+        const emit = struct {
+            pixels: []u32,
+            paint: *const SmPaint,
+            clip_mask: ?[]const u8,
+            fn run(self: @This(), canvas_w_: u32, x: i32, y: i32, cov: []const u8) void {
+                SmBlitter.blitRow(self.pixels, canvas_w_, x, y, @intCast(cov.len), cov, self.paint, self.clip_mask);
+            }
+        }{ .pixels = pixels, .paint = paint, .clip_mask = clip_mask };
+        try sweepAnalytic(edges, allocator, canvas_w, canvas_h, fill_rule, aa_accum, cov_row, emit);
+    } else {
+        try sweepEdges(edges, allocator, pixels, canvas_w, canvas_h, fill_rule, clip_mask, paint, aa_accum, cov_row);
+    }
 }
 
 /// fillPolygonF — fill an arbitrary simple polygon with anti-aliasing.
@@ -455,14 +503,25 @@ pub fn fillPolygonF(
     while (i < vertices.len) : (i += 1) {
         const j: usize = if (i + 1 == vertices.len) 0 else i + 1;
         try addEdge(
-            &edges, allocator,
-            vertices[i][0], vertices[i][1],
-            vertices[j][0], vertices[j][1],
+            &edges,
+            allocator,
+            vertices[i][0],
+            vertices[i][1],
+            vertices[j][0],
+            vertices[j][1],
         );
     }
-    try sweepEdges(
-        &edges, allocator, pixels, canvas_w, canvas_h,
-        .evenodd, clip_mask, paint, aa_accum, cov_row,
+    try sweepFill(
+        &edges,
+        allocator,
+        pixels,
+        canvas_w,
+        canvas_h,
+        .evenodd,
+        clip_mask,
+        paint,
+        aa_accum,
+        cov_row,
     );
 }
 
@@ -491,6 +550,21 @@ pub fn fillPathToCoverage(
     fill_rule: FillRule,
     antialias: bool,
 ) !void {
+    return fillPathToCoverageMode(allocator, mask, canvas_w, canvas_h, path, fill_rule, antialias, .analytic);
+}
+
+/// `fillPathToCoverage` with the converter chosen (the clip path has no
+/// paint to carry `aa_mode`).
+pub fn fillPathToCoverageMode(
+    allocator: std.mem.Allocator,
+    mask: []u8,
+    canvas_w: u32,
+    canvas_h: u32,
+    path: *const SmPath,
+    fill_rule: FillRule,
+    antialias: bool,
+    aa_mode: SmPaint.AaMode,
+) !void {
     if (path.verbs.len == 0) return;
     if (canvas_w == 0 or canvas_h == 0) return;
 
@@ -498,15 +572,38 @@ pub fn fillPathToCoverage(
     defer edges.deinit(allocator);
     try flattenPathToFillEdges(allocator, path, &edges);
 
-    const aa_accum = try allocator.alloc(f32, canvas_w);
+    const aa_accum = try allocator.alloc(f32, canvas_w + accum_slack);
     defer allocator.free(aa_accum);
     const cov_row = try allocator.alloc(u8, canvas_w);
     defer allocator.free(cov_row);
 
+    if (antialias and aa_mode == .analytic) {
+        const emit = struct {
+            mask: []u8,
+            fn run(self: @This(), canvas_w_: u32, x: i32, y: i32, cov: []const u8) void {
+                const off = @as(usize, @intCast(y)) * @as(usize, canvas_w_) + @as(usize, @intCast(x));
+                @memcpy(self.mask[off .. off + cov.len], cov);
+            }
+        }{ .mask = mask };
+        try sweepAnalytic(&edges, allocator, canvas_w, canvas_h, fill_rule, aa_accum, cov_row, emit);
+        return;
+    }
     try sweepEdgesToCoverageMask(
-        &edges, allocator, mask, canvas_w, canvas_h, fill_rule, aa_accum, cov_row, antialias,
+        &edges,
+        allocator,
+        mask,
+        canvas_w,
+        canvas_h,
+        fill_rule,
+        aa_accum,
+        cov_row,
+        antialias,
     );
 }
+
+/// Cells the analytic accumulator needs beyond the canvas width: a
+/// segment ending exactly at x = W deposits into cells W and W + 1.
+pub const accum_slack: u32 = 2;
 
 /// Number of sub-y samples per integer scanline for AA path fills.
 /// 8 levels per axis combined with analytic-x partial coverage gives full
@@ -737,6 +834,229 @@ fn sweepEdges(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Analytic coverage (signed area accumulation).
+// ---------------------------------------------------------------------------
+//
+// The exact area of the path inside each pixel, per row, from one pass
+// over the active edges: each edge's segment within the row deposits its
+// signed height ("cover", direction × dy) into the cells it crosses,
+// split by the area the segment cuts off inside each cell, and a prefix
+// sum across the row turns those deltas into the winding integral per
+// cell. Nonzero coverage is min(1, |sum|); even-odd folds the sum onto a
+// triangle wave. There is no sub-scanline, no per-sub-sample sort and no
+// cost proportional to the fill area × 8: the work is the outline length
+// plus one linear pass over the touched span. The accumulation is the
+// one in font-rs (Raph Levien) and stb_truetype's v2 rasterizer.
+//
+// Edges are clipped to the canvas horizontally BEFORE the sweep: a piece
+// left of x = 0 becomes a vertical edge at 0 (its cover applies to the
+// whole row), a piece right of x = W a vertical at W (cells beyond the
+// canvas, never read), so every deposit lands in [0, W + 1].
+//
+// The result is not byte-equal to the supersampled sweep: that one
+// quantized the vertical position to eighths, this one does not. The
+// test below measures the difference over seeded paths and pins it.
+
+/// Deposit one row segment into the accumulator. `xa`, `xb` are the
+/// segment's x at the row's entry and exit (either order, clamped to
+/// [0, W]); `d` is direction × the segment's height within the row.
+inline fn depositSegment(acc: []f32, xa: f32, xb: f32, d: f32) void {
+    const x0 = @min(xa, xb);
+    const x1 = @max(xa, xb);
+    const x0floor = @floor(x0);
+    const x0i: usize = @intFromFloat(x0floor);
+    const x1ceil = @ceil(x1);
+    const x1i: usize = @intFromFloat(x1ceil);
+    if (x1i <= x0i + 1) {
+        // Within one cell: the area right of the segment is the mean x.
+        const xmf = 0.5 * (xa + xb) - x0floor;
+        acc[x0i] += d - d * xmf;
+        acc[x0i + 1] += d * xmf;
+        return;
+    }
+    const s = 1.0 / (x1 - x0);
+    const x0f = x0 - x0floor;
+    const a0 = 0.5 * s * (1.0 - x0f) * (1.0 - x0f);
+    const x1f = x1 - x1ceil + 1.0;
+    const am = 0.5 * s * x1f * x1f;
+    acc[x0i] += d * a0;
+    if (x1i == x0i + 2) {
+        acc[x0i + 1] += d * (1.0 - a0 - am);
+    } else {
+        const a1 = s * (1.5 - x0f);
+        acc[x0i + 1] += d * (a1 - a0);
+        var xi = x0i + 2;
+        while (xi < x1i - 1) : (xi += 1) acc[xi] += d * s;
+        const a2 = a1 + @as(f32, @floatFromInt(x1i - x0i - 3)) * s;
+        acc[x1i - 1] += d * (1.0 - a2 - am);
+    }
+    acc[x1i] += d * am;
+}
+
+/// Split every edge at x = 0 and x = W and clamp the outside pieces to
+/// verticals on the boundary (see the section comment).
+fn clipEdgesToWidth(edges: *const EdgeBuf, allocator: std.mem.Allocator, out: *EdgeBuf, w: f64) !void {
+    for (edges.ptr[0..edges.len]) |e| {
+        var y_lo = e.y_min;
+        const y_hi = e.y_max;
+        var x_lo = e.x_at_y_min;
+        const x_hi = e.x_at_y_min + (y_hi - y_lo) * e.inv_slope;
+        // Up to two crossings; walk them in y order.
+        var crossings: [2]f64 = undefined;
+        var n: usize = 0;
+        inline for (.{ 0.0, w }) |bx| {
+            if ((x_lo < bx and x_hi > bx) or (x_lo > bx and x_hi < bx)) {
+                crossings[n] = e.y_min + (bx - e.x_at_y_min) / e.inv_slope;
+                n += 1;
+            }
+        }
+        if (n == 2 and crossings[0] > crossings[1]) std.mem.swap(f64, &crossings[0], &crossings[1]);
+        var k: usize = 0;
+        while (true) {
+            const y_cut = if (k < n) crossings[k] else y_hi;
+            if (y_cut > y_lo) {
+                const x_cut = e.x_at_y_min + (y_cut - e.y_min) * e.inv_slope;
+                const mid = 0.5 * (x_lo + x_cut);
+                var piece: Edge = .{ .y_min = y_lo, .y_max = y_cut, .x_at_y_min = x_lo, .inv_slope = e.inv_slope, .direction = e.direction };
+                if (mid <= 0.0) {
+                    piece.x_at_y_min = 0.0;
+                    piece.inv_slope = 0.0;
+                } else if (mid >= w) {
+                    piece.x_at_y_min = w;
+                    piece.inv_slope = 0.0;
+                }
+                try out.append(allocator, piece);
+                y_lo = y_cut;
+                x_lo = x_cut;
+            }
+            if (k >= n) break;
+            k += 1;
+        }
+    }
+}
+
+/// The analytic converter. `emit.run(canvas_w, x, y, cov)` receives every
+/// run of non-zero coverage bytes (the blitter for fills, the mask for
+/// clips). `aa_accum` must have `canvas_w + accum_slack` cells.
+fn sweepAnalytic(
+    edges_in: *EdgeBuf,
+    allocator: std.mem.Allocator,
+    canvas_w: u32,
+    canvas_h: u32,
+    fill_rule: FillRule,
+    aa_accum: []f32,
+    cov_row: []u8,
+    emit: anytype,
+) !void {
+    if (edges_in.len == 0) return;
+    if (aa_accum.len < canvas_w + accum_slack or cov_row.len < canvas_w) return;
+
+    var edges: EdgeBuf = .{};
+    defer edges.deinit(allocator);
+    try clipEdgesToWidth(edges_in, allocator, &edges, @floatFromInt(canvas_w));
+    if (edges.len == 0) return;
+    sortEdgesByYMin(edges.ptr[0..edges.len]);
+
+    var y_min_total: f64 = std.math.inf(f64);
+    var y_max_total: f64 = -std.math.inf(f64);
+    for (edges.ptr[0..edges.len]) |e| {
+        if (e.y_min < y_min_total) y_min_total = e.y_min;
+        if (e.y_max > y_max_total) y_max_total = e.y_max;
+    }
+    const ch_i: i32 = @intCast(canvas_h);
+    const cw_i: i32 = @intCast(canvas_w);
+    const y_start: i32 = @max(0, @as(i32, @intFromFloat(@floor(y_min_total))));
+    const y_end: i32 = @min(ch_i, @as(i32, @intFromFloat(@ceil(y_max_total))));
+    if (y_start >= y_end) return;
+
+    const acc = aa_accum[0 .. canvas_w + accum_slack];
+    @memset(acc, 0.0);
+    const w_f: f64 = @floatFromInt(canvas_w);
+
+    var active: ActiveBuf = .{};
+    defer active.deinit(allocator);
+    var next_idx: usize = 0;
+
+    var y_int: i32 = y_start;
+    while (y_int < y_end) : (y_int += 1) {
+        const y_top: f64 = @floatFromInt(y_int);
+        const y_bot: f64 = y_top + 1.0;
+
+        var k: usize = 0;
+        while (k < active.len) {
+            if (active.ptr[k].y_max <= y_top) {
+                active.ptr[k] = active.ptr[active.len - 1];
+                active.len -= 1;
+            } else {
+                k += 1;
+            }
+        }
+        while (next_idx < edges.len and edges.ptr[next_idx].y_min < y_bot) {
+            const e = edges.ptr[next_idx];
+            try active.append(allocator, .{
+                .y_min = e.y_min,
+                .y_max = e.y_max,
+                .x_at_y_min = e.x_at_y_min,
+                .inv_slope = e.inv_slope,
+                .dir = e.direction,
+            });
+            next_idx += 1;
+        }
+        if (active.len < 2) continue;
+
+        // Deposit every active edge's segment within this row.
+        var row_x_min: i32 = cw_i + @as(i32, accum_slack);
+        var row_x_max: i32 = 0;
+        for (active.ptr[0..active.len]) |a| {
+            const ya = @max(y_top, a.y_min);
+            const yb = @min(y_bot, a.y_max);
+            if (yb <= ya) continue;
+            const xa64 = @min(w_f, @max(0.0, a.x_at_y_min + (ya - a.y_min) * a.inv_slope));
+            const xb64 = @min(w_f, @max(0.0, a.x_at_y_min + (yb - a.y_min) * a.inv_slope));
+            const d: f32 = @floatCast(@as(f64, @floatFromInt(a.dir)) * (yb - ya));
+            depositSegment(acc, @floatCast(xa64), @floatCast(xb64), d);
+            const lo_i: i32 = @intFromFloat(@floor(@min(xa64, xb64)));
+            const hi_i: i32 = @as(i32, @intFromFloat(@ceil(@max(xa64, xb64)))) + 2;
+            if (lo_i < row_x_min) row_x_min = lo_i;
+            if (hi_i > row_x_max) row_x_max = hi_i;
+        }
+        if (row_x_min >= row_x_max) continue;
+        row_x_max = @min(row_x_max, cw_i + @as(i32, accum_slack));
+
+        // Prefix sum → coverage → u8, emitting each non-zero run. The sum
+        // is zero left of row_x_min (nothing deposited there) and the
+        // visible cells end at W.
+        const x_end: i32 = @min(row_x_max, cw_i);
+        var sum: f32 = 0.0;
+        var x: i32 = row_x_min;
+        var run_start: i32 = -1;
+        while (x < x_end) : (x += 1) {
+            sum += acc[@intCast(x)];
+            var cov: f32 = undefined;
+            if (fill_rule == .nonzero) {
+                cov = @min(1.0, @abs(sum));
+            } else {
+                var t = @abs(sum);
+                t -= 2.0 * @floor(t * 0.5);
+                cov = if (t > 1.0) 2.0 - t else t;
+            }
+            const v = cov * 256.0;
+            if (v < 1.0) {
+                if (run_start >= 0) {
+                    emit.run(canvas_w, run_start, y_int, cov_row[@intCast(run_start)..@intCast(x)]);
+                    run_start = -1;
+                }
+                continue;
+            }
+            if (run_start < 0) run_start = x;
+            cov_row[@intCast(x)] = if (v >= 255.0) 255 else @intFromFloat(v);
+        }
+        if (run_start >= 0) emit.run(canvas_w, run_start, y_int, cov_row[@intCast(run_start)..@intCast(x_end)]);
+        @memset(acc[@intCast(row_x_min)..@intCast(row_x_max)], 0.0);
+    }
+}
+
 /// AA scanline sweep that writes per-pixel u8 coverage into `mask`.
 /// Structurally identical to `sweepEdges`: 8× sub-y supersample +
 /// analytic-x partial coverage → quantize to u8 → emit. The only
@@ -922,9 +1242,12 @@ const PointBuf = SmList(Vec2);
 fn flattenQuadPoints(
     pts: *PointBuf,
     allocator: std.mem.Allocator,
-    p0x: f64, p0y: f64,
-    cpx: f64, cpy: f64,
-    p1x: f64, p1y: f64,
+    p0x: f64,
+    p0y: f64,
+    cpx: f64,
+    cpy: f64,
+    p1x: f64,
+    p1y: f64,
     depth: u32,
 ) !void {
     if (depth >= 16 or isQuadFlat(p0x, p0y, cpx, cpy, p1x, p1y)) {
@@ -944,10 +1267,14 @@ fn flattenQuadPoints(
 fn flattenCubicPoints(
     pts: *PointBuf,
     allocator: std.mem.Allocator,
-    p0x: f64, p0y: f64,
-    c1x: f64, c1y: f64,
-    c2x: f64, c2y: f64,
-    p1x: f64, p1y: f64,
+    p0x: f64,
+    p0y: f64,
+    c1x: f64,
+    c1y: f64,
+    c2x: f64,
+    c2y: f64,
+    p1x: f64,
+    p1y: f64,
     depth: u32,
 ) !void {
     if (depth >= 18 or isCubicFlat(p0x, p0y, c1x, c1y, c2x, c2y, p1x, p1y)) {
@@ -1307,8 +1634,14 @@ fn dashAndStrokePolyline(
             if (remaining_in_dash <= 1e-12) {
                 if (on and sub.len >= 2) {
                     try strokePolyline(
-                        edges, allocator, sub.ptr[0..sub.len],
-                        half_w, miter_limit, line_cap, line_join, false,
+                        edges,
+                        allocator,
+                        sub.ptr[0..sub.len],
+                        half_w,
+                        miter_limit,
+                        line_cap,
+                        line_join,
+                        false,
                     );
                 }
                 sub.len = 0;
@@ -1337,8 +1670,14 @@ fn dashAndStrokePolyline(
             if (remaining_in_dash <= 1e-12) {
                 if (on and sub.len >= 2) {
                     try strokePolyline(
-                        edges, allocator, sub.ptr[0..sub.len],
-                        half_w, miter_limit, line_cap, line_join, false,
+                        edges,
+                        allocator,
+                        sub.ptr[0..sub.len],
+                        half_w,
+                        miter_limit,
+                        line_cap,
+                        line_join,
+                        false,
                     );
                 }
                 sub.len = 0;
@@ -1351,8 +1690,14 @@ fn dashAndStrokePolyline(
     // Flush trailing on-interval.
     if (on and sub.len >= 2) {
         try strokePolyline(
-            edges, allocator, sub.ptr[0..sub.len],
-            half_w, miter_limit, line_cap, line_join, false,
+            edges,
+            allocator,
+            sub.ptr[0..sub.len],
+            half_w,
+            miter_limit,
+            line_cap,
+            line_join,
+            false,
         );
     }
 }
@@ -1510,14 +1855,20 @@ pub fn strokePath(
     var edges: EdgeBuf = .{};
     defer edges.deinit(allocator);
     try flattenPathToStrokeEdges(
-        allocator, path, &edges,
-        line_width, line_cap, line_join, miter_limit,
-        line_dash, line_dash_offset,
+        allocator,
+        path,
+        &edges,
+        line_width,
+        line_cap,
+        line_join,
+        miter_limit,
+        line_dash,
+        line_dash_offset,
     );
     // Stroke outline polygon is filled with the standard non-zero winding
     // rule (the donut is built CCW outer + CW inner) — fill rule is not
     // user-controllable for strokes.
-    try sweepEdges(&edges, allocator, pixels, canvas_w, canvas_h, .nonzero, clip_mask, paint, aa_accum, cov_row);
+    try sweepFill(&edges, allocator, pixels, canvas_w, canvas_h, .nonzero, clip_mask, paint, aa_accum, cov_row);
 }
 
 // ---------------------------------------------------------------------------
@@ -1557,13 +1908,44 @@ fn testPath(allocator: std.mem.Allocator, r: std.Random, i: usize) !SmPath {
     return path;
 }
 
-/// The golden: a Wyhash over the pixels of `fillPath` and the mask of
-/// `fillPathToCoverage` for the 32 test paths. Changes that promise not
-/// to move a byte (range-clearing the accumulator, the sort) keep it;
-/// the analytic converter replaces it with a measured tolerance.
+/// The goldens: a Wyhash over the pixels of `fillPath` and the mask of
+/// `fillPathToCoverage` for the 32 test paths, one per converter. The
+/// supersampled one is the pre-M17 output and must not move; the
+/// analytic one was taken on the converter's first run and later groups
+/// must not move it either. `0` prints the hash instead of checking it.
 const golden_supersample8: u64 = 0x82e80ad2a7f05938;
+const golden_analytic: u64 = 0x69a51f067f3fca65;
 
-test "coverage goldens: 32 seeded paths through fillPath and fillPathToCoverage" {
+/// The analytic converter against the supersampled sweep, over the mask
+/// bytes of the antialiased test paths where either is non-zero. First
+/// run (2026-09-03): 32,088 covered pixels, mean 0.353 LSB, p99.9 66,
+/// max 201; pinned with headroom on the mean and the percentile. The
+/// maximum is reported, not gated: the random cubics self-intersect with
+/// mixed winding signs, and inside one pixel the signed-area sum cancels
+/// where the supersampled spans did not (the approximation every
+/// signed-area converter makes; Skia's falls back to supersampling for
+/// such paths). Shapes whose winding is 0/1 everywhere — every distilled
+/// SWF fill — accumulate exactly, which the rectangle paths check: their
+/// only difference is the sweep's eighth-of-a-row vertical quantization
+/// on the top and bottom rows (at most 1/8 of coverage, 32 LSB).
+const tol_mean_max: f64 = 0.75;
+const tol_p999_max: u32 = 96;
+const tol_rect_max: u32 = 33;
+
+fn maxChannelDelta(a: []const u32, b: []const u32) u32 {
+    var m: u32 = 0;
+    for (a, b) |x, y| {
+        inline for (0..4) |ch| {
+            const shift: u5 = @intCast(ch * 8);
+            const xa: i32 = @intCast((x >> shift) & 0xFF);
+            const yb: i32 = @intCast((y >> shift) & 0xFF);
+            m = @max(m, @as(u32, @intCast(@abs(xa - yb))));
+        }
+    }
+    return m;
+}
+
+test "coverage goldens and the analytic tolerance: 32 seeded paths through fillPath and fillPathToCoverage" {
     const a = std.testing.allocator;
     const W: u32 = 96;
     const H: u32 = 64;
@@ -1571,31 +1953,79 @@ test "coverage goldens: 32 seeded paths through fillPath and fillPathToCoverage"
     const r = prng.random();
     const pixels = try a.alloc(u32, W * H);
     defer a.free(pixels);
+    const pixels_ref = try a.alloc(u32, W * H);
+    defer a.free(pixels_ref);
     const mask = try a.alloc(u8, W * H);
     defer a.free(mask);
-    const accum = try a.alloc(f32, W);
+    const mask_ref = try a.alloc(u8, W * H);
+    defer a.free(mask_ref);
+    const accum = try a.alloc(f32, W + accum_slack);
     defer a.free(accum);
     const cov = try a.alloc(u8, W);
     defer a.free(cov);
-    var hasher = std.hash.Wyhash.init(0);
+    var h_ss = std.hash.Wyhash.init(0);
+    var h_an = std.hash.Wyhash.init(0);
+    var hist = [_]u64{0} ** 256;
+    var sum_delta: u64 = 0;
+    var count: u64 = 0;
+    var max_px: u32 = 0;
+    var max_rect: u32 = 0;
     var i: usize = 0;
     while (i < 32) : (i += 1) {
         var path = try testPath(a, r, i);
         defer path.deinit();
         const rule: FillRule = if (i & 1 == 0) .nonzero else .evenodd;
         const aa = (i % 4) != 3;
-        @memset(pixels, 0xFF202020);
-        const paint: SmPaint = .{ .shader = .{ .solid = 0xFFE0A040 }, .style = .fill, .blend_mode = .src_over, .antialias = aa };
-        try fillPath(a, pixels, W, H, &path, rule, null, &paint, accum, cov);
-        hasher.update(std.mem.sliceAsBytes(pixels));
-        @memset(mask, 0);
-        try fillPathToCoverage(a, mask, W, H, &path, rule, aa);
-        hasher.update(mask);
+        inline for (.{ SmPaint.AaMode.supersample8, SmPaint.AaMode.analytic }) |mode| {
+            const px = if (mode == .supersample8) pixels_ref else pixels;
+            const mk = if (mode == .supersample8) mask_ref else mask;
+            const hs = if (mode == .supersample8) &h_ss else &h_an;
+            @memset(px, 0xFF202020);
+            const paint: SmPaint = .{ .shader = .{ .solid = 0xFFE0A040 }, .style = .fill, .blend_mode = .src_over, .antialias = aa, .aa_mode = mode };
+            try fillPath(a, px, W, H, &path, rule, null, &paint, accum, cov);
+            hs.update(std.mem.sliceAsBytes(px));
+            @memset(mk, 0);
+            try fillPathToCoverageMode(a, mk, W, H, &path, rule, aa, mode);
+            hs.update(mk);
+        }
+        if (!aa) {
+            // One sample per pixel takes the same sweep in both modes.
+            try std.testing.expectEqualSlices(u8, mask_ref, mask);
+            try std.testing.expectEqualSlices(u32, pixels_ref, pixels);
+            continue;
+        }
+        const is_rect = (i % 5) == 4;
+        for (mask, mask_ref) |m, mr| {
+            if (m == 0 and mr == 0) continue;
+            const d: u32 = @intCast(@abs(@as(i32, m) - @as(i32, mr)));
+            hist[d] += 1;
+            sum_delta += d;
+            count += 1;
+            if (is_rect) max_rect = @max(max_rect, d);
+        }
+        max_px = @max(max_px, maxChannelDelta(pixels, pixels_ref));
     }
-    const h = hasher.final();
-    if (golden_supersample8 == 0) {
-        std.debug.print("\ngolden_supersample8 = 0x{x}\n", .{h});
+    var acc: u64 = 0;
+    var p999: u32 = 0;
+    var max_d: u32 = 0;
+    const target = count - count / 1000;
+    for (hist, 0..) |n, d| {
+        if (n > 0) max_d = @intCast(d);
+        if (p999 == 0 and n > 0) {
+            acc += n;
+            if (acc >= target) p999 = @intCast(d);
+        }
+    }
+    const mean = @as(f64, @floatFromInt(sum_delta)) / @as(f64, @floatFromInt(@max(count, 1)));
+    std.debug.print("\nanalytic vs supersample8 over {d} covered pixels: mean {d:.3} LSB, p99.9 {d}, max {d} (rects {d}); pixel max {d}\n", .{ count, mean, p999, max_d, max_rect, max_px });
+    try std.testing.expectEqual(golden_supersample8, h_ss.final());
+    const h = h_an.final();
+    if (golden_analytic == 0) {
+        std.debug.print("golden_analytic = 0x{x}\n", .{h});
     } else {
-        try std.testing.expectEqual(golden_supersample8, h);
+        try std.testing.expectEqual(golden_analytic, h);
     }
+    try std.testing.expect(mean <= tol_mean_max);
+    try std.testing.expect(p999 <= tol_p999_max);
+    try std.testing.expect(max_rect <= tol_rect_max);
 }

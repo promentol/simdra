@@ -74,9 +74,9 @@ pub const StateFrame = struct {
 /// Filter-op opcode tags. Each verb consumes a fixed number of param
 /// floats — see `filterParamCount`.
 pub const FilterOp = enum(u8) {
-    blur = 0,        // 1 param: sigma (px)
-    brightness = 1,  // 1 param: factor
-    contrast = 2,    // 1 param: factor
+    blur = 0, // 1 param: sigma (px)
+    brightness = 1, // 1 param: factor
+    contrast = 2, // 1 param: factor
 };
 
 inline fn filterParamCount(op: FilterOp) u8 {
@@ -313,9 +313,11 @@ fn ensureAaScratch(self: *SmCanvas) ?struct { accum: []f32, cov: []u8 } {
     const w: usize = self.surface.width;
     if (w == 0) return null;
     const allocator = self.surface.getAllocator();
-    if (self.aa_accum == null or self.aa_accum.?.len < w) {
+    // The analytic converter deposits into two cells past the width.
+    const accum_len = w + SmScan.accum_slack;
+    if (self.aa_accum == null or self.aa_accum.?.len < accum_len) {
         if (self.aa_accum) |s| allocator.free(s);
-        self.aa_accum = allocator.alloc(f32, w) catch {
+        self.aa_accum = allocator.alloc(f32, accum_len) catch {
             self.aa_accum = null;
             return null;
         };
@@ -785,7 +787,8 @@ const CompositeLayer = struct {
 inline fn beginCompositeLayer(self: *SmCanvas) ?CompositeLayer {
     if (!self.blendMode.requiresLayerComposite()) return null;
     if (self.scratch_pixels == null or
-        self.scratch_pixels.?.len != self.pixels.len) {
+        self.scratch_pixels.?.len != self.pixels.len)
+    {
         if (self.scratch_pixels) |s| self.surface.getAllocator().free(s);
         self.scratch_pixels = self.surface.getAllocator().alloc(u32, self.pixels.len) catch return null;
     }
@@ -1306,14 +1309,22 @@ pub fn roundRect(
     if (aw < 0) {
         ax += aw;
         aw = -aw;
-        const t1 = rtl; rtl = rtr; rtr = t1;
-        const t2 = rbl; rbl = rbr; rbr = t2;
+        const t1 = rtl;
+        rtl = rtr;
+        rtr = t1;
+        const t2 = rbl;
+        rbl = rbr;
+        rbr = t2;
     }
     if (ah < 0) {
         ay += ah;
         ah = -ah;
-        const t1 = rtl; rtl = rbl; rbl = t1;
-        const t2 = rtr; rtr = rbr; rbr = t2;
+        const t1 = rtl;
+        rtl = rbl;
+        rbl = t1;
+        const t2 = rtr;
+        rtr = rbr;
+        rbr = t2;
     }
     const top = rtl + rtr;
     const right = rtr + rbr;
@@ -1486,9 +1497,12 @@ pub fn drawRect(self: *SmCanvas, x: f64, y: f64, w: f64, h: f64, paint: *const S
 /// served by the T7 path stroke through `ctx.stroke()`).
 pub fn drawTriangle(
     self: *SmCanvas,
-    x0: f64, y0: f64,
-    x1: f64, y1: f64,
-    x2: f64, y2: f64,
+    x0: f64,
+    y0: f64,
+    x1: f64,
+    y1: f64,
+    x2: f64,
+    y2: f64,
     paint: *const SmPaint,
 ) void {
     const p0 = self.current_transform.applyToPoint(x0, y0);
@@ -1505,9 +1519,12 @@ pub fn drawTriangle(
 /// analytic-x partial-coverage on triangle boundaries.
 fn drawTriangleNoTransform(
     self: *SmCanvas,
-    x0: f64, y0: f64,
-    x1: f64, y1: f64,
-    x2: f64, y2: f64,
+    x0: f64,
+    y0: f64,
+    x1: f64,
+    y1: f64,
+    x2: f64,
+    y2: f64,
     paint: *const SmPaint,
 ) void {
     const aa = self.ensureAaScratch() orelse return;
@@ -1544,7 +1561,10 @@ inline fn isIntegerAligned4(x: f64, y: f64, w: f64, h: f64) bool {
 /// while integer-aligned rects keep the binary blitRow fast path.
 fn drawRectAxisAligned(
     self: *SmCanvas,
-    x: f64, y: f64, w: f64, h: f64,
+    x: f64,
+    y: f64,
+    w: f64,
+    h: f64,
     paint: *const SmPaint,
 ) void {
     if (SmPaint.includesFill(paint.style)) {
@@ -1578,7 +1598,10 @@ fn drawRectAxisAligned(
 /// boundary cells — Skia and every browser do this.
 fn fillRectSpan(
     self: *SmCanvas,
-    x: f64, y: f64, w: f64, h: f64,
+    x: f64,
+    y: f64,
+    w: f64,
+    h: f64,
     paint: *const SmPaint,
 ) void {
     if (paint.blend_mode == .src or isIntegerAligned4(x, y, w, h)) {
@@ -1834,9 +1857,12 @@ pub fn strokeRect(self: *SmCanvas, x: f64, y: f64, w: f64, h: f64) void {
 
 pub fn fillTriangle(
     self: *SmCanvas,
-    x0: f64, y0: f64,
-    x1: f64, y1: f64,
-    x2: f64, y2: f64,
+    x0: f64,
+    y0: f64,
+    x1: f64,
+    y1: f64,
+    x2: f64,
+    y2: f64,
 ) void {
     const filter = self.beginFilterLayer();
     defer self.endFilterLayer(filter);
@@ -1850,9 +1876,12 @@ pub fn fillTriangle(
 
 pub fn strokeTriangle(
     self: *SmCanvas,
-    x0: f64, y0: f64,
-    x1: f64, y1: f64,
-    x2: f64, y2: f64,
+    x0: f64,
+    y0: f64,
+    x1: f64,
+    y1: f64,
+    x2: f64,
+    y2: f64,
 ) void {
     const filter = self.beginFilterLayer();
     defer self.endFilterLayer(filter);
@@ -1946,10 +1975,12 @@ pub fn getImageDataSettings(
 pub fn drawImageAt(self: *SmCanvas, bitmap: SmBitmap, dx: f64, dy: f64) void {
     self.drawImageScaledSub(
         bitmap,
-        0, 0,
+        0,
+        0,
         @floatFromInt(bitmap.width),
         @floatFromInt(bitmap.height),
-        dx, dy,
+        dx,
+        dy,
         @floatFromInt(bitmap.width),
         @floatFromInt(bitmap.height),
     );
@@ -1960,14 +1991,21 @@ pub fn drawImageAt(self: *SmCanvas, bitmap: SmBitmap, dx: f64, dy: f64) void {
 pub fn drawImageScaled(
     self: *SmCanvas,
     bitmap: SmBitmap,
-    dx: f64, dy: f64, dw: f64, dh: f64,
+    dx: f64,
+    dy: f64,
+    dw: f64,
+    dh: f64,
 ) void {
     self.drawImageScaledSub(
         bitmap,
-        0, 0,
+        0,
+        0,
         @floatFromInt(bitmap.width),
         @floatFromInt(bitmap.height),
-        dx, dy, dw, dh,
+        dx,
+        dy,
+        dw,
+        dh,
     );
 }
 
@@ -1977,8 +2015,14 @@ pub fn drawImageScaled(
 pub fn drawImageScaledSub(
     self: *SmCanvas,
     bitmap: SmBitmap,
-    sx: f64, sy: f64, sw: f64, sh: f64,
-    dx: f64, dy: f64, dw: f64, dh: f64,
+    sx: f64,
+    sy: f64,
+    sw: f64,
+    sh: f64,
+    dx: f64,
+    dy: f64,
+    dw: f64,
+    dh: f64,
 ) void {
     if (bitmap.pixelFormat != .rgba_unorm8) return;
     if (bitmap.width == 0 or bitmap.height == 0) return;
@@ -2098,8 +2142,16 @@ pub fn drawImageScaledSub(
             src_pixels,
             bitmap.width,
             bitmap.height,
-            sx, sy, sw, sh,
-            inv.a, inv.b, inv.c, inv.d, inv.e, inv.f,
+            sx,
+            sy,
+            sw,
+            sh,
+            inv.a,
+            inv.b,
+            inv.c,
+            inv.d,
+            inv.e,
+            inv.f,
             dst_x0_i,
             py,
         );
@@ -2132,17 +2184,41 @@ inline fn sampleImageRow(
 ) void {
     if (smoothing) {
         simd.sampleImageBilinearRow(
-            dst, src_pixels, src_w, src_h,
-            src_rect_x, src_rect_y, src_rect_w, src_rect_h,
-            inv_a, inv_b, inv_c, inv_d, inv_e, inv_f,
-            x_start, y,
+            dst,
+            src_pixels,
+            src_w,
+            src_h,
+            src_rect_x,
+            src_rect_y,
+            src_rect_w,
+            src_rect_h,
+            inv_a,
+            inv_b,
+            inv_c,
+            inv_d,
+            inv_e,
+            inv_f,
+            x_start,
+            y,
         );
     } else {
         simd.sampleImageNearestRow(
-            dst, src_pixels, src_w, src_h,
-            src_rect_x, src_rect_y, src_rect_w, src_rect_h,
-            inv_a, inv_b, inv_c, inv_d, inv_e, inv_f,
-            x_start, y,
+            dst,
+            src_pixels,
+            src_w,
+            src_h,
+            src_rect_x,
+            src_rect_y,
+            src_rect_w,
+            src_rect_h,
+            inv_a,
+            inv_b,
+            inv_c,
+            inv_d,
+            inv_e,
+            inv_f,
+            x_start,
+            y,
         );
     }
 }
@@ -2159,8 +2235,10 @@ inline fn sampleImageRow(
 pub fn writePixels(self: *SmCanvas, bitmap: SmBitmap, dx: i32, dy: i32) void {
     self.writePixelsDirty(
         bitmap,
-        dx, dy,
-        0, 0,
+        dx,
+        dy,
+        0,
+        0,
         @intCast(bitmap.width),
         @intCast(bitmap.height),
     );
@@ -2174,9 +2252,12 @@ pub fn writePixels(self: *SmCanvas, bitmap: SmBitmap, dx: i32, dy: i32) void {
 pub fn writePixelsDirty(
     self: *SmCanvas,
     bitmap: SmBitmap,
-    dx: i32, dy: i32,
-    dirty_x: i32, dirty_y: i32,
-    dirty_w: i32, dirty_h: i32,
+    dx: i32,
+    dy: i32,
+    dirty_x: i32,
+    dirty_y: i32,
+    dirty_w: i32,
+    dirty_h: i32,
 ) void {
     // Step 1 only handles rgba_unorm8. Float16 needs the symmetric
     // `copyFloat16NormToU32` SIMD kernel — a future addition.

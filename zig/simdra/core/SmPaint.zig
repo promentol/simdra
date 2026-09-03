@@ -115,6 +115,11 @@ pub const LineJoin = enum(u8) {
 ///     `hard_light`, `soft_light`, `difference`, `exclusion`.
 ///   • Non-separable blend (HSL-shape color manipulation): `hue`,
 ///     `saturation`, `color`, `luminosity`.
+pub const AaMode = enum(u8) {
+    analytic = 0,
+    supersample8 = 1,
+};
+
 pub const BlendMode = enum(u8) {
     // Porter-Duff
     src_over = 0,
@@ -203,6 +208,11 @@ blend_mode: BlendMode = .src_over,
 /// renders with one sample per pixel, and a reference image taken that
 /// way has hard edges nothing can match with a soft one.
 antialias: bool = true,
+/// How antialiased coverage is computed (see SmScan): `.analytic` is the
+/// exact signed-area converter; `.supersample8` the eight-sub-scanline
+/// sweep it replaced, kept for A/B and for the converter's tolerance
+/// test. Irrelevant when `antialias` is false (one sample per pixel).
+aa_mode: AaMode = .analytic,
 /// Per-paint alpha modulator (0..255). Solid paints fold this into their
 /// `Shader.solid` color at construction time (`SmCanvas.applyAlphaModulation`).
 /// Gradient paints carry it through to `SmBlitter.dispatchGradient`, which

@@ -30,6 +30,7 @@
 //! bugs surface immediately.
 
 const generic = @import("generic.zig");
+const vec_blend = @import("vec_blend.zig");
 
 // --- u32 RGBA → f16 RGBA with /255 normalization ---------------------------
 // Lane plan per chunk (N = 8 pixels):
@@ -84,8 +85,8 @@ pub const SrcOverChunkPixels = generic.SrcOverChunkPixels;
 pub const fillU32 = generic.fillU32;
 pub const copyU32 = generic.copyU32;
 pub const clipCombineU8 = generic.clipCombineU8;
-pub const blendSrcOverU32 = generic.blendSrcOverU32;
-pub const blendSrcOverCovU32 = generic.blendSrcOverCovU32;
+pub const blendSrcOverU32 = vec_blend.blendSrcOverU32;
+pub const blendSrcOverCovU32 = vec_blend.blendSrcOverCovU32;
 pub const blendAddU32 = generic.blendAddU32;
 
 pub const blendSrcInU32 = generic.blendSrcInU32;

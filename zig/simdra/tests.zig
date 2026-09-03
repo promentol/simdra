@@ -9,4 +9,5 @@ test {
     _ = @import("effects/SmGradient.zig");
     _ = @import("effects/SmPattern.zig");
     _ = @import("opts/generic.zig");
+    _ = @import("opts/tolerance_test.zig");
 }

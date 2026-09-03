@@ -149,6 +149,132 @@ inline fn dispatchShader(
     paint: *const SmPaint,
     clip_row: ?[]const u8,
 ) void {
+    // Sample the shader into a source row, modulate it once, blend the
+    // row with ONE kernel call. The per-pixel version this replaced
+    // (`dispatchShaderReference`, kept for the test) built a one-pixel
+    // paint and ran the 27-way blend switch for every pixel.
+    const py: f64 = @as(f64, @floatFromInt(y)) + 0.5;
+    var src_stack: [ROW_CHUNK]u32 = undefined;
+    var keep_stack: [ROW_CHUNK]u8 = undefined;
+    var off: usize = 0;
+    while (off < row.len) {
+        const n = @min(row.len - off, ROW_CHUNK);
+        const src = src_stack[0..n];
+        for (src, 0..) |*s, i| {
+            const px: f64 = @as(f64, @floatFromInt(x_start + @as(i32, @intCast(off + i)))) + 0.5;
+            s.* = switch (paint.shader) {
+                .gradient => |g| switch (g.geometry) {
+                    .linear => g.sampleLinear(px, py),
+                    .radial => g.sampleRadial(px, py),
+                    .conic => g.sampleConic(px, py),
+                },
+                .pattern => |pat| pat.sample(px, py),
+                .solid => unreachable,
+            };
+        }
+        const cov_slice: ?[]const u8 = if (coverage) |c| c[off..][0..n] else null;
+        const clip_slice: ?[]const u8 = if (clip_row) |c| c[off..][0..n] else null;
+        prepareSourceRow(src, keep_stack[0..n], src, cov_slice, paint, clip_slice);
+        dispatchRowSrc(row[off..][0..n], src, if (clip_row != null) keep_stack[0..n] else null, paint.blend_mode, paint.dst_color_type);
+        off += n;
+    }
+}
+
+/// Rows longer than this are blended in chunks (stack scratch).
+const ROW_CHUNK = 4096;
+
+/// The source row a row kernel consumes: per-paint colour transform,
+/// surface byte order, global alpha, coverage and a partial clip folded
+/// into the source alpha — in the order the per-pixel dispatch applied
+/// them — and `keep[i]` = 0 where the clip is 0 (destination untouched),
+/// 255 otherwise. `src_out` may alias `src_in`.
+inline fn prepareSourceRow(
+    src_out: []u32,
+    keep: []u8,
+    src_in: []const u32,
+    coverage: ?[]const u8,
+    paint: *const SmPaint,
+    clip_row: ?[]const u8,
+) void {
+    const cxform = !paint.cxform.isIdentity();
+    const bgra = paint.dst_color_type == .bgra8888;
+    const ga = paint.global_alpha;
+    for (src_in, 0..) |s0, i| {
+        var s = s0;
+        if (cxform) s = paint.cxform.apply(s);
+        if (bgra) s = simd.swizzleRB(s);
+        if (ga != 0xFF) s = modulateAlpha(s, ga);
+        if (coverage) |cov| s = modulateAlpha(s, cov[i]);
+        var k: u8 = 255;
+        if (clip_row) |cr| {
+            if (cr[i] == 0) {
+                k = 0;
+            } else if (cr[i] != 0xFF) {
+                s = modulateAlpha(s, cr[i]);
+            }
+        }
+        src_out[i] = s;
+        keep[i] = k;
+    }
+}
+
+/// One row-kernel call for a per-pixel source; `mask` 0 skips, 255 takes
+/// the blend, in between lerps (see generic.zig's RowU32 family). The
+/// lum-asymmetric non-separable modes pick their BGRA twins by `ct`.
+fn dispatchRowSrc(dst: []u32, src: []const u32, mask: ?[]const u8, mode: SmPaint.BlendMode, ct: types.ColorType) void {
+    if (ct == .bgra8888) {
+        switch (mode) {
+            .hue => return simd.blendHueRowBgraU32(dst, src, mask),
+            .saturation => return simd.blendSaturationRowBgraU32(dst, src, mask),
+            .color => return simd.blendColorRowBgraU32(dst, src, mask),
+            .luminosity => return simd.blendLuminosityRowBgraU32(dst, src, mask),
+            else => {},
+        }
+    }
+    switch (mode) {
+        .src, .copy => simd.blendSrcRowU32(dst, src, mask),
+        .src_over => simd.blendSrcOverRowU32(dst, src, mask),
+        .src_in => simd.blendSrcInRowU32(dst, src, mask),
+        .src_out => simd.blendSrcOutRowU32(dst, src, mask),
+        .src_atop => simd.blendSrcAtopRowU32(dst, src, mask),
+        .dst_over => simd.blendDstOverRowU32(dst, src, mask),
+        .dst_in => simd.blendDstInRowU32(dst, src, mask),
+        .dst_out => simd.blendDstOutRowU32(dst, src, mask),
+        .dst_atop => simd.blendDstAtopRowU32(dst, src, mask),
+        .xor => simd.blendXorRowU32(dst, src, mask),
+        .add => simd.blendAddRowU32(dst, src, mask),
+        .multiply => simd.blendMultiplyRowU32(dst, src, mask),
+        .screen => simd.blendScreenRowU32(dst, src, mask),
+        .overlay => simd.blendOverlayRowU32(dst, src, mask),
+        .darken => simd.blendDarkenRowU32(dst, src, mask),
+        .lighten => simd.blendLightenRowU32(dst, src, mask),
+        .color_dodge => simd.blendColorDodgeRowU32(dst, src, mask),
+        .color_burn => simd.blendColorBurnRowU32(dst, src, mask),
+        .hard_light => simd.blendHardLightRowU32(dst, src, mask),
+        .soft_light => simd.blendSoftLightRowU32(dst, src, mask),
+        .difference => simd.blendDifferenceRowU32(dst, src, mask),
+        .exclusion => simd.blendExclusionRowU32(dst, src, mask),
+        .hue => simd.blendHueRowU32(dst, src, mask),
+        .saturation => simd.blendSaturationRowU32(dst, src, mask),
+        .color => simd.blendColorRowU32(dst, src, mask),
+        .luminosity => simd.blendLuminosityRowU32(dst, src, mask),
+        .flash_subtract => simd.blendFlashSubtractRowU32(dst, src, mask),
+        .flash_invert => simd.blendFlashInvertRowU32(dst, src, mask),
+        .flash_alpha => simd.blendFlashAlphaRowU32(dst, src, mask),
+        .flash_erase => simd.blendFlashEraseRowU32(dst, src, mask),
+    }
+}
+
+/// The per-pixel dispatch `dispatchShader` replaced — the reference its
+/// test compares against, byte for byte.
+fn dispatchShaderReference(
+    row: []u32,
+    x_start: i32,
+    y: i32,
+    coverage: ?[]const u8,
+    paint: *const SmPaint,
+    clip_row: ?[]const u8,
+) void {
     const py: f64 = @as(f64, @floatFromInt(y)) + 0.5;
     var i: usize = 0;
     while (i < row.len) : (i += 1) {
@@ -311,6 +437,26 @@ pub fn blitRowFromSource(
     clip_row: ?[]const u8,
 ) void {
     std.debug.assert(dst.len == src.len);
+    var src_stack: [ROW_CHUNK]u32 = undefined;
+    var keep_stack: [ROW_CHUNK]u8 = undefined;
+    var off: usize = 0;
+    while (off < dst.len) {
+        const n = @min(dst.len - off, ROW_CHUNK);
+        const clip_slice: ?[]const u8 = if (clip_row) |c| c[off..][0..n] else null;
+        prepareSourceRow(src_stack[0..n], keep_stack[0..n], src[off..][0..n], null, paint, clip_slice);
+        dispatchRowSrc(dst[off..][0..n], src_stack[0..n], if (clip_row != null) keep_stack[0..n] else null, paint.blend_mode, paint.dst_color_type);
+        off += n;
+    }
+}
+
+/// The per-pixel version, kept as the test's reference.
+fn blitRowFromSourceReference(
+    dst: []u32,
+    src: []const u32,
+    paint: *const SmPaint,
+    clip_row: ?[]const u8,
+) void {
+    std.debug.assert(dst.len == src.len);
     var i: usize = 0;
     while (i < dst.len) : (i += 1) {
         var s: u32 = src[i];
@@ -365,10 +511,21 @@ pub fn blitFullMasked(
     mask: ?[]const u8,
 ) void {
     std.debug.assert(dst.len == src.len);
-    // For each pixel, build a one-pixel "paint" and dispatch the same blend
-    // logic the row blitter uses. Avoids duplicating per-mode code. Both
-    // buffers are already in surface order (`ct` selects the lum-aware
-    // non-separable kernels; no source swizzling happens here).
+    // Both buffers are already in surface order (`ct` selects the
+    // lum-aware non-separable kernels; no source swizzling happens here);
+    // the mask's skip/lerp rule lives in the row kernels.
+    dispatchRowSrc(dst, src, mask, mode, ct);
+}
+
+/// The per-pixel version, kept as the test's reference.
+fn blitFullMaskedReference(
+    dst: []u32,
+    src: []const u32,
+    mode: SmPaint.BlendMode,
+    ct: types.ColorType,
+    mask: ?[]const u8,
+) void {
+    std.debug.assert(dst.len == src.len);
     var i: usize = 0;
     while (i < dst.len) : (i += 1) {
         const cov: u8 = if (mask) |m| m[i] else 255;
@@ -382,17 +539,7 @@ pub fn blitFullMasked(
     }
 }
 
-fn lerpU32(a: u32, b: u32, t: u8) u32 {
-    var out: u32 = 0;
-    inline for (0..4) |ch| {
-        const shift: u5 = @intCast(ch * 8);
-        const av: u32 = (a >> shift) & 0xFF;
-        const bv: u32 = (b >> shift) & 0xFF;
-        const v = (av * (255 - @as(u32, t)) + bv * @as(u32, t) + 127) / 255;
-        out |= v << shift;
-    }
-    return out;
-}
+const lerpU32 = simd.lerpU32;
 
 test "resolveSolid forwards the solid color unchanged" {
     const p: SmPaint = .{ .shader = .{ .solid = 0x80FF8040 } };
@@ -636,4 +783,129 @@ inline fn dispatchSolid(row: []u32, paint: *const SmPaint, ct: types.ColorType) 
         .flash_alpha => simd.blendFlashAlphaU32(row, solid),
         .flash_erase => simd.blendFlashEraseU32(row, solid),
     }
+}
+
+/// Max per-channel delta between two rows (the ±1 LSB rule of the tuned
+/// backends, see opts/tolerance_test.zig).
+fn maxChannelDelta(a: []const u32, b: []const u32) u32 {
+    var m: u32 = 0;
+    for (a, b) |x, y| {
+        inline for (0..4) |ch| {
+            const shift: u5 = @intCast(ch * 8);
+            const xa: i32 = @intCast((x >> shift) & 0xFF);
+            const yb: i32 = @intCast((y >> shift) & 0xFF);
+            m = @max(m, @as(u32, @intCast(@abs(xa - yb))));
+        }
+    }
+    return m;
+}
+
+fn expectWithin1(want: []const u32, got: []const u32) !void {
+    const d = maxChannelDelta(want, got);
+    if (d > 1) {
+        std.debug.print("hoisted row differs from the per-pixel reference by {d} LSB\n", .{d});
+        return error.TestUnexpectedResult;
+    }
+}
+
+test "hoisted row dispatch == per-pixel reference (±1 LSB): every mode x coverage x clip x cxform x bgra x global_alpha" {
+    // The reference runs the scalar one-pixel kernels; the hoisted path
+    // runs the backend's row kernels, which on aarch64 are the vector ones
+    // held to ±1 LSB. Untouched pixels must still match exactly, and they
+    // do: a zero clip byte is a zero mask, which every row kernel skips.
+    const SmGradient = @import("../effects/SmGradient.zig");
+    const SmPattern = @import("../effects/SmPattern.zig");
+    const ta = std.testing.allocator;
+
+    var g = SmGradient.linearWithAllocator(ta, 0, 0, 45, 0);
+    defer g.deinit();
+    try g.addColorStop(0.0, "rgba(255, 32, 8, 0.8)");
+    try g.addColorStop(0.5, "rgba(10, 200, 90, 0.3)");
+    try g.addColorStop(1.0, "#0040ff");
+    g.setSpread(.reflect);
+    const tile = [8]u8{ 250, 60, 10, 255, 20, 90, 200, 128 };
+    var pat = try SmPattern.createWithAllocator(ta, &tile, 2, 1, .repeat);
+    defer pat.deinit();
+    pat.setFilter(.bilinear);
+
+    const N = 45;
+    var prng = std.Random.DefaultPrng.init(0x5a5a);
+    const r = prng.random();
+    var dst_init: [N]u32 = undefined;
+    var cov: [N]u8 = undefined;
+    var clip: [N]u8 = undefined;
+    var src_row: [N]u32 = undefined;
+    for (0..N) |i| {
+        dst_init[i] = r.int(u32);
+        if (i % 3 == 0) dst_init[i] |= 0xFF000000;
+        if (i % 7 == 0) dst_init[i] &= 0x00FFFFFF;
+        cov[i] = switch (i % 5) {
+            0 => 0,
+            1 => 255,
+            else => r.int(u8),
+        };
+        clip[i] = switch (i % 4) {
+            0 => 0,
+            1 => 255,
+            else => r.int(u8),
+        };
+        src_row[i] = r.int(u32);
+    }
+    const cx_id: SmPaint.ColorTransform = .{};
+    const cx: SmPaint.ColorTransform = .{ .mult = .{ 200, 256, 300, 256 }, .add = .{ 10, -20, 0, 5 } };
+    const shaders = [2]SmPaint.Shader{ .{ .gradient = &g }, .{ .pattern = &pat } };
+    const cov_opts = [_]?[]const u8{ null, &cov };
+    const clip_opts = [_]?[]const u8{ null, &clip };
+    const cts = [_]types.ColorType{ .rgba8888, .bgra8888 };
+
+    for (std.enums.values(SmPaint.BlendMode)) |mode| {
+        for (cov_opts) |coverage| for (clip_opts) |clip_row| for ([_]SmPaint.ColorTransform{ cx_id, cx }) |cxf| for (cts) |ct| for ([_]u8{ 255, 77 }) |ga| {
+            for (shaders) |shader| {
+                var p: SmPaint = .{ .shader = shader, .blend_mode = mode, .cxform = cxf, .global_alpha = ga, .dst_color_type = ct };
+                var a = dst_init;
+                var b = dst_init;
+                dispatchShader(&a, 3, 7, coverage, &p, clip_row);
+                dispatchShaderReference(&b, 3, 7, coverage, &p, clip_row);
+                try expectWithin1(&b, &a);
+            }
+            var p: SmPaint = .{ .shader = .{ .solid = 0 }, .blend_mode = mode, .cxform = cxf, .global_alpha = ga, .dst_color_type = ct };
+            var a = dst_init;
+            var b = dst_init;
+            blitRowFromSource(&a, &src_row, &p, clip_row);
+            blitRowFromSourceReference(&b, &src_row, &p, clip_row);
+            try expectWithin1(&b, &a);
+        };
+        for (cov_opts) |mask| for (cts) |ct| {
+            var a = dst_init;
+            var b = dst_init;
+            blitFullMasked(&a, &src_row, mode, ct, mask);
+            blitFullMaskedReference(&b, &src_row, mode, ct, mask);
+            try expectWithin1(&b, &a);
+        };
+    }
+
+    // A row wider than the stack chunk takes the chunk loop.
+    const W = ROW_CHUNK + 100;
+    const wide_dst = try ta.alloc(u32, W);
+    defer ta.free(wide_dst);
+    const wide_ref = try ta.alloc(u32, W);
+    defer ta.free(wide_ref);
+    const wide_src = try ta.alloc(u32, W);
+    defer ta.free(wide_src);
+    const wide_clip = try ta.alloc(u8, W);
+    defer ta.free(wide_clip);
+    for (0..W) |i| {
+        wide_dst[i] = r.int(u32);
+        wide_src[i] = r.int(u32);
+        wide_clip[i] = r.int(u8);
+    }
+    @memcpy(wide_ref, wide_dst);
+    var wp: SmPaint = .{ .shader = .{ .gradient = &g }, .blend_mode = .multiply, .cxform = cx, .global_alpha = 200 };
+    blitRowFromSource(wide_dst, wide_src, &wp, wide_clip);
+    blitRowFromSourceReference(wide_ref, wide_src, &wp, wide_clip);
+    try expectWithin1(wide_ref, wide_dst);
+    @memcpy(wide_ref, wide_dst);
+    dispatchShader(wide_dst, -50, 2, wide_clip, &wp, null);
+    dispatchShaderReference(wide_ref, -50, 2, wide_clip, &wp, null);
+    try expectWithin1(wide_ref, wide_dst);
 }

@@ -280,11 +280,21 @@ inline fn blendAddScalar(src: u32, dst: u32) u32 {
 // Porter-Duff pipeline does premult → weighted-sum → un-premult, drifting
 // the output by 2-3 LSB per pixel. Keep it exact here; LLVM lowers to
 // multiply-by-reciprocal so the cost is negligible.
-inline fn d255(x: u32) u32 { return x / 255; }
-inline fn channelR(p: u32) u32 { return p & 0xFF; }
-inline fn channelG(p: u32) u32 { return (p >> 8) & 0xFF; }
-inline fn channelB(p: u32) u32 { return (p >> 16) & 0xFF; }
-inline fn channelA(p: u32) u32 { return (p >> 24) & 0xFF; }
+inline fn d255(x: u32) u32 {
+    return x / 255;
+}
+inline fn channelR(p: u32) u32 {
+    return p & 0xFF;
+}
+inline fn channelG(p: u32) u32 {
+    return (p >> 8) & 0xFF;
+}
+inline fn channelB(p: u32) u32 {
+    return (p >> 16) & 0xFF;
+}
+inline fn channelA(p: u32) u32 {
+    return (p >> 24) & 0xFF;
+}
 inline fn packRGBA(r: u32, g: u32, b: u32, a: u32) u32 {
     return r | (g << 8) | (b << 16) | (a << 24);
 }
@@ -321,12 +331,17 @@ const BlendKernel = struct {
 };
 
 inline fn blendScalar(src: u32, dst: u32, comptime k: BlendKernel) u32 {
-    const sa = channelA(src); const da = channelA(dst);
+    const sa = channelA(src);
+    const da = channelA(dst);
     const ao = k.aoOf(sa, da);
     if (ao == 0) return 0;
 
-    const sr = channelR(src); const sg = channelG(src); const sb = channelB(src);
-    const dr = channelR(dst); const dg = channelG(dst); const db = channelB(dst);
+    const sr = channelR(src);
+    const sg = channelG(src);
+    const sb = channelB(src);
+    const dr = channelR(dst);
+    const dg = channelG(dst);
+    const db = channelB(dst);
 
     const rp = k.coOf(sr, dr, sa, da);
     const gp = k.coOf(sg, dg, sa, da);
@@ -345,12 +360,32 @@ inline fn blendScalar(src: u32, dst: u32, comptime k: BlendKernel) u32 {
 // ---- Porter-Duff kernels --------------------------------------------------
 
 // Factor functions per W3C spec.
-fn faOne(sa: u32, da: u32) u32 { _ = sa; _ = da; return 255; }
-fn faZero(sa: u32, da: u32) u32 { _ = sa; _ = da; return 0; }
-fn faSa(sa: u32, da: u32) u32 { _ = da; return sa; }
-fn faDa(sa: u32, da: u32) u32 { _ = sa; return da; }
-fn faInvSa(sa: u32, da: u32) u32 { _ = da; return 255 - sa; }
-fn faInvDa(sa: u32, da: u32) u32 { _ = sa; return 255 - da; }
+fn faOne(sa: u32, da: u32) u32 {
+    _ = sa;
+    _ = da;
+    return 255;
+}
+fn faZero(sa: u32, da: u32) u32 {
+    _ = sa;
+    _ = da;
+    return 0;
+}
+fn faSa(sa: u32, da: u32) u32 {
+    _ = da;
+    return sa;
+}
+fn faDa(sa: u32, da: u32) u32 {
+    _ = sa;
+    return da;
+}
+fn faInvSa(sa: u32, da: u32) u32 {
+    _ = da;
+    return 255 - sa;
+}
+fn faInvDa(sa: u32, da: u32) u32 {
+    _ = sa;
+    return 255 - da;
+}
 
 fn pdKernel(comptime fa: FactorFn, comptime fb: FactorFn) BlendKernel {
     return .{
@@ -370,15 +405,33 @@ fn pdKernel(comptime fa: FactorFn, comptime fb: FactorFn) BlendKernel {
 }
 
 // Per-operator scalar wrappers. Naming mirrors W3C spec.
-fn srcOverScalarPD(src: u32, dst: u32) u32 { return blendScalar(src, dst, pdKernel(faOne, faInvSa)); }
-fn srcInScalar(src: u32, dst: u32) u32 { return blendScalar(src, dst, pdKernel(faDa, faZero)); }
-fn srcOutScalar(src: u32, dst: u32) u32 { return blendScalar(src, dst, pdKernel(faInvDa, faZero)); }
-fn srcAtopScalar(src: u32, dst: u32) u32 { return blendScalar(src, dst, pdKernel(faDa, faInvSa)); }
-fn dstOverScalar(src: u32, dst: u32) u32 { return blendScalar(src, dst, pdKernel(faInvDa, faOne)); }
-fn dstInScalar(src: u32, dst: u32) u32 { return blendScalar(src, dst, pdKernel(faZero, faSa)); }
-fn dstOutScalar(src: u32, dst: u32) u32 { return blendScalar(src, dst, pdKernel(faZero, faInvSa)); }
-fn dstAtopScalar(src: u32, dst: u32) u32 { return blendScalar(src, dst, pdKernel(faInvDa, faSa)); }
-fn xorScalar(src: u32, dst: u32) u32 { return blendScalar(src, dst, pdKernel(faInvDa, faInvSa)); }
+fn srcOverScalarPD(src: u32, dst: u32) u32 {
+    return blendScalar(src, dst, pdKernel(faOne, faInvSa));
+}
+fn srcInScalar(src: u32, dst: u32) u32 {
+    return blendScalar(src, dst, pdKernel(faDa, faZero));
+}
+fn srcOutScalar(src: u32, dst: u32) u32 {
+    return blendScalar(src, dst, pdKernel(faInvDa, faZero));
+}
+fn srcAtopScalar(src: u32, dst: u32) u32 {
+    return blendScalar(src, dst, pdKernel(faDa, faInvSa));
+}
+fn dstOverScalar(src: u32, dst: u32) u32 {
+    return blendScalar(src, dst, pdKernel(faInvDa, faOne));
+}
+fn dstInScalar(src: u32, dst: u32) u32 {
+    return blendScalar(src, dst, pdKernel(faZero, faSa));
+}
+fn dstOutScalar(src: u32, dst: u32) u32 {
+    return blendScalar(src, dst, pdKernel(faZero, faInvSa));
+}
+fn dstAtopScalar(src: u32, dst: u32) u32 {
+    return blendScalar(src, dst, pdKernel(faInvDa, faSa));
+}
+fn xorScalar(src: u32, dst: u32) u32 {
+    return blendScalar(src, dst, pdKernel(faInvDa, faInvSa));
+}
 
 // ---- Separable-blend kernels ----------------------------------------------
 
@@ -403,10 +456,18 @@ fn sepKernel(comptime B: ChannelFn) BlendKernel {
 }
 
 // Per-channel blend functions B(Cb, Cs). Inputs in 0..255.
-fn bMultiply(cb: u32, cs: u32) u32 { return d255(cb * cs); }
-fn bScreen(cb: u32, cs: u32) u32 { return cb + cs - d255(cb * cs); }
-fn bDarken(cb: u32, cs: u32) u32 { return @min(cb, cs); }
-fn bLighten(cb: u32, cs: u32) u32 { return @max(cb, cs); }
+fn bMultiply(cb: u32, cs: u32) u32 {
+    return d255(cb * cs);
+}
+fn bScreen(cb: u32, cs: u32) u32 {
+    return cb + cs - d255(cb * cs);
+}
+fn bDarken(cb: u32, cs: u32) u32 {
+    return @min(cb, cs);
+}
+fn bLighten(cb: u32, cs: u32) u32 {
+    return @max(cb, cs);
+}
 fn bDifference(cb: u32, cs: u32) u32 {
     return if (cb > cs) cb - cs else cs - cb;
 }
@@ -435,7 +496,9 @@ fn bHardLight(cb: u32, cs: u32) u32 {
     const cs2 = cs * 2 - 255; // 0..255
     return cb + cs2 - d255(cb * cs2);
 }
-fn bOverlay(cb: u32, cs: u32) u32 { return bHardLight(cs, cb); } // hard-light with args swapped
+fn bOverlay(cb: u32, cs: u32) u32 {
+    return bHardLight(cs, cb);
+} // hard-light with args swapped
 fn bSoftLight(cb: u32, cs: u32) u32 {
     // W3C definition uses real arithmetic; do it in floats then convert back.
     const Cb = @as(f64, @floatFromInt(cb)) / 255.0;
@@ -477,7 +540,9 @@ fn bSoftLight(cb: u32, cs: u32) u32 {
 
 const RGB = struct { r: f64, g: f64, b: f64 };
 
-inline fn lum(c: RGB) f64 { return 0.30 * c.r + 0.59 * c.g + 0.11 * c.b; }
+inline fn lum(c: RGB) f64 {
+    return 0.30 * c.r + 0.59 * c.g + 0.11 * c.b;
+}
 inline fn satRgb(c: RGB) f64 {
     return @max(@max(c.r, c.g), c.b) - @min(@min(c.r, c.g), c.b);
 }
@@ -513,23 +578,59 @@ fn setLum(c: RGB, target: f64) RGB {
 
 fn setSat(c: RGB, s: f64) RGB {
     // Find min/mid/max channels and rescale: max → s, mid → s*(mid-min)/(max-min), min → 0.
-    var rs = c.r; var gs = c.g; var bs = c.b;
+    var rs = c.r;
+    var gs = c.g;
+    var bs = c.b;
     // Sort by value while keeping track of which channel is which.
     // 6-case branch — readable and exhaustive.
-    var min_v: f64 = undefined; var mid_v: f64 = undefined; var max_v: f64 = undefined;
-    var min_i: u8 = 0; var mid_i: u8 = 1; var max_i: u8 = 2;
+    var min_v: f64 = undefined;
+    var mid_v: f64 = undefined;
+    var max_v: f64 = undefined;
+    var min_i: u8 = 0;
+    var mid_i: u8 = 1;
+    var max_i: u8 = 2;
     if (rs >= gs and rs >= bs) {
-        max_v = rs; max_i = 0;
-        if (gs >= bs) { mid_v = gs; mid_i = 1; min_v = bs; min_i = 2; }
-        else { mid_v = bs; mid_i = 2; min_v = gs; min_i = 1; }
+        max_v = rs;
+        max_i = 0;
+        if (gs >= bs) {
+            mid_v = gs;
+            mid_i = 1;
+            min_v = bs;
+            min_i = 2;
+        } else {
+            mid_v = bs;
+            mid_i = 2;
+            min_v = gs;
+            min_i = 1;
+        }
     } else if (gs >= rs and gs >= bs) {
-        max_v = gs; max_i = 1;
-        if (rs >= bs) { mid_v = rs; mid_i = 0; min_v = bs; min_i = 2; }
-        else { mid_v = bs; mid_i = 2; min_v = rs; min_i = 0; }
+        max_v = gs;
+        max_i = 1;
+        if (rs >= bs) {
+            mid_v = rs;
+            mid_i = 0;
+            min_v = bs;
+            min_i = 2;
+        } else {
+            mid_v = bs;
+            mid_i = 2;
+            min_v = rs;
+            min_i = 0;
+        }
     } else {
-        max_v = bs; max_i = 2;
-        if (rs >= gs) { mid_v = rs; mid_i = 0; min_v = gs; min_i = 1; }
-        else { mid_v = gs; mid_i = 1; min_v = rs; min_i = 0; }
+        max_v = bs;
+        max_i = 2;
+        if (rs >= gs) {
+            mid_v = rs;
+            mid_i = 0;
+            min_v = gs;
+            min_i = 1;
+        } else {
+            mid_v = gs;
+            mid_i = 1;
+            min_v = rs;
+            min_i = 0;
+        }
     }
     const out_min: f64 = 0;
     var out_mid: f64 = 0;
@@ -538,10 +639,27 @@ fn setSat(c: RGB, s: f64) RGB {
         out_mid = (mid_v - min_v) * s / (max_v - min_v);
         out_max = s;
     }
-    rs = 0; gs = 0; bs = 0;
-    switch (min_i) { 0 => rs = out_min, 1 => gs = out_min, 2 => bs = out_min, else => unreachable }
-    switch (mid_i) { 0 => rs = out_mid, 1 => gs = out_mid, 2 => bs = out_mid, else => unreachable }
-    switch (max_i) { 0 => rs = out_max, 1 => gs = out_max, 2 => bs = out_max, else => unreachable }
+    rs = 0;
+    gs = 0;
+    bs = 0;
+    switch (min_i) {
+        0 => rs = out_min,
+        1 => gs = out_min,
+        2 => bs = out_min,
+        else => unreachable,
+    }
+    switch (mid_i) {
+        0 => rs = out_mid,
+        1 => gs = out_mid,
+        2 => bs = out_mid,
+        else => unreachable,
+    }
+    switch (max_i) {
+        0 => rs = out_max,
+        1 => gs = out_max,
+        2 => bs = out_max,
+        else => unreachable,
+    }
     return .{ .r = rs, .g = gs, .b = bs };
 }
 
@@ -675,7 +793,8 @@ inline fn nonSepScalar(src: u32, dst: u32, comptime kind: NonSepKind, comptime s
 }
 
 inline fn nonSepScalarRgba(src: u32, dst: u32, comptime kind: NonSepKind) u32 {
-    const sa = channelA(src); const da = channelA(dst);
+    const sa = channelA(src);
+    const da = channelA(dst);
     const inv_sa: u32 = 255 - sa;
     const ao = @min(@as(u32, 255), sa + d255(da * inv_sa));
     if (ao == 0) return 0;
@@ -816,6 +935,81 @@ fn rowOfCovNonSep(comptime kind: NonSepKind, comptime swap_rb: bool) fn (dst: []
         }
     }.run;
 }
+
+// ---- Per-pixel-source row family ------------------------------------------
+//
+// `blend<Mode>RowU32(dst, src, mask)`: the blend of a SOURCE ROW onto a
+// destination row — gradients, patterns, drawImage rows and layer
+// composites, whose source colour changes per pixel. `mask` is optional:
+// 0 leaves the destination untouched, 255 takes the blend, anything
+// between lerps the two (the semantics `blitFullMasked` had). Built by
+// construction from the solid kernels on one-pixel slices, so it is
+// exactly what the per-pixel dispatch used to do; the vector backend
+// replaces the hot members.
+
+/// `a + (b - a) * t / 255` per channel, round-to-nearest.
+pub fn lerpU32(a: u32, b: u32, t: u8) u32 {
+    var out: u32 = 0;
+    inline for (0..4) |ch| {
+        const shift: u5 = @intCast(ch * 8);
+        const av: u32 = (a >> shift) & 0xFF;
+        const bv: u32 = (b >> shift) & 0xFF;
+        const v = (av * (255 - @as(u32, t)) + bv * @as(u32, t) + 127) / 255;
+        out |= v << shift;
+    }
+    return out;
+}
+
+fn rowOfSrc(comptime kernel: fn (dst: []u32, src_color: u32) void) fn (dst: []u32, src: []const u32, mask: ?[]const u8) void {
+    return struct {
+        fn run(dst: []u32, src: []const u32, mask: ?[]const u8) void {
+            std.debug.assert(dst.len == src.len);
+            for (dst, src, 0..) |*p, s, i| {
+                const m: u8 = if (mask) |mm| mm[i] else 255;
+                if (m == 0) continue;
+                const before = p.*;
+                var slot = [_]u32{before};
+                kernel(slot[0..1], s);
+                p.* = if (m == 255) slot[0] else lerpU32(before, slot[0], m);
+            }
+        }
+    }.run;
+}
+
+pub const blendSrcRowU32 = rowOfSrc(fillU32);
+pub const blendSrcOverRowU32 = rowOfSrc(blendSrcOverU32);
+pub const blendSrcInRowU32 = rowOfSrc(blendSrcInU32);
+pub const blendSrcOutRowU32 = rowOfSrc(blendSrcOutU32);
+pub const blendSrcAtopRowU32 = rowOfSrc(blendSrcAtopU32);
+pub const blendDstOverRowU32 = rowOfSrc(blendDstOverU32);
+pub const blendDstInRowU32 = rowOfSrc(blendDstInU32);
+pub const blendDstOutRowU32 = rowOfSrc(blendDstOutU32);
+pub const blendDstAtopRowU32 = rowOfSrc(blendDstAtopU32);
+pub const blendXorRowU32 = rowOfSrc(blendXorU32);
+pub const blendAddRowU32 = rowOfSrc(blendAddU32);
+pub const blendMultiplyRowU32 = rowOfSrc(blendMultiplyU32);
+pub const blendScreenRowU32 = rowOfSrc(blendScreenU32);
+pub const blendOverlayRowU32 = rowOfSrc(blendOverlayU32);
+pub const blendDarkenRowU32 = rowOfSrc(blendDarkenU32);
+pub const blendLightenRowU32 = rowOfSrc(blendLightenU32);
+pub const blendColorDodgeRowU32 = rowOfSrc(blendColorDodgeU32);
+pub const blendColorBurnRowU32 = rowOfSrc(blendColorBurnU32);
+pub const blendHardLightRowU32 = rowOfSrc(blendHardLightU32);
+pub const blendSoftLightRowU32 = rowOfSrc(blendSoftLightU32);
+pub const blendDifferenceRowU32 = rowOfSrc(blendDifferenceU32);
+pub const blendExclusionRowU32 = rowOfSrc(blendExclusionU32);
+pub const blendHueRowU32 = rowOfSrc(blendHueU32);
+pub const blendSaturationRowU32 = rowOfSrc(blendSaturationU32);
+pub const blendColorRowU32 = rowOfSrc(blendColorU32);
+pub const blendLuminosityRowU32 = rowOfSrc(blendLuminosityU32);
+pub const blendFlashSubtractRowU32 = rowOfSrc(blendFlashSubtractU32);
+pub const blendFlashInvertRowU32 = rowOfSrc(blendFlashInvertU32);
+pub const blendFlashAlphaRowU32 = rowOfSrc(blendFlashAlphaU32);
+pub const blendFlashEraseRowU32 = rowOfSrc(blendFlashEraseU32);
+pub const blendHueRowBgraU32 = rowOfSrc(blendHueBgraU32);
+pub const blendSaturationRowBgraU32 = rowOfSrc(blendSaturationBgraU32);
+pub const blendColorRowBgraU32 = rowOfSrc(blendColorBgraU32);
+pub const blendLuminosityRowBgraU32 = rowOfSrc(blendLuminosityBgraU32);
 
 // Porter-Duff coverage variants.
 pub const blendSrcInCovU32 = rowOfCov(pdKernel(faDa, faZero));
@@ -1090,7 +1284,7 @@ pub fn gaussianBlurU32(
     //   [4*total..5*total) blur scratch
     std.debug.assert(scratch.len >= total * 5);
     const ch_r = scratch[0..total];
-    const ch_g = scratch[total..2 * total];
+    const ch_g = scratch[total .. 2 * total];
     const ch_b = scratch[2 * total .. 3 * total];
     const ch_a = scratch[3 * total .. 4 * total];
     const blur_scratch = scratch[4 * total .. 5 * total];

@@ -347,6 +347,8 @@ fn ensureAaScratch(self: *SmCanvas) ?struct { accum: []f64, cov: []u8 } {
             self.aa_accum = null;
             return null;
         };
+        // Zero once: the sweeps keep it zero (see SmScan.sweepAnalytic).
+        @memset(self.aa_accum.?, 0.0);
     }
     if (self.aa_coverage == null or self.aa_coverage.?.len < w) {
         if (self.aa_coverage) |s| allocator.free(s);

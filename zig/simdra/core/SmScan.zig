@@ -427,6 +427,8 @@ pub fn pointInEdges(edges: []const Edge, x: f64, y: f64, fill_rule: FillRule) bo
 /// `aa_accum` and `cov_row` are caller-owned per-row scratch buffers,
 /// each sized to at least `canvas_w`. Reused across scanlines and
 /// across `fill()` / `stroke()` calls (allocated lazily on `SmCanvas`).
+/// `aa_accum` (canvas_w + accum_slack cells) must arrive zeroed and is
+/// left zeroed: the analytic sweep clears only the cells it touches.
 pub fn fillPath(
     allocator: std.mem.Allocator,
     pixels: []u32,
@@ -625,6 +627,7 @@ pub fn fillPathToCoverageBox(
 
     const aa_accum = try allocator.alloc(f64, canvas_w + accum_slack);
     defer allocator.free(aa_accum);
+    @memset(aa_accum, 0.0);
     const cov_row = try allocator.alloc(u8, canvas_w);
     defer allocator.free(cov_row);
 
@@ -1057,6 +1060,15 @@ fn sortIntervals(ivs: []CellIv) void {
     }
 }
 
+/// A memset that stays inline for the short runs a row mostly has.
+inline fn fillBytes(dst: []u8, byte: u8) void {
+    if (dst.len < 32) {
+        for (dst) |*d| d.* = byte;
+    } else {
+        @memset(dst, byte);
+    }
+}
+
 /// The coverage of a prefix sum under the fill rule, quantized as the
 /// walk always did: the sum in f64, the rule in f32.
 inline fn coverageOf(sum: f64, fill_rule: FillRule) f32 {
@@ -1105,8 +1117,13 @@ fn sweepAnalytic(
     }
     if (y_start >= y_end) return;
 
+    // The accumulator arrives zero and leaves zero: the scratch is
+    // zeroed when it is allocated (SweepScratch.ensure, SmCanvas's
+    // ensureAaScratch) and every row below clears the cells it
+    // touched, so no clear of the whole width per fill (32 KB for a
+    // span build of a wide shape, 200 times a frame).
     const acc = aa_accum[0 .. canvas_w + accum_slack];
-    @memset(acc, 0.0);
+    errdefer @memset(acc, 0.0);
     const w_f: f64 = @floatFromInt(canvas_w);
 
     var active: ActiveBuf = .{};
@@ -1211,12 +1228,13 @@ fn sweepAnalytic(
                 } else {
                     if (run_start < 0) run_start = x;
                     const byte: u8 = if (v >= 255.0) 255 else @intFromFloat(v);
-                    @memset(cov_row[@intCast(x)..@intCast(seg_lo)], byte);
+                    fillBytes(cov_row[@intCast(x)..@intCast(seg_lo)], byte);
                 }
                 x = seg_lo;
             }
             while (x < seg_hi) : (x += 1) {
                 sum += acc[@intCast(x)];
+                acc[@intCast(x)] = 0.0;
                 const cov = coverageOf(sum, fill_rule);
                 const v = cov * 256.0;
                 if (v < 1.0) {
@@ -1231,13 +1249,14 @@ fn sweepAnalytic(
             }
         }
         if (run_start >= 0) emit.run(canvas_w, run_start, y_int, cov_row[@intCast(run_start)..@intCast(x_end)]);
-        // Clear only the cells the deposits touched: a wide fill's row
-        // is a few cells at each edge, not the whole width (the clear
-        // of the whole range was the largest memset in a Flash frame).
+        // The walk zeroed every cell it read; the touched cells past the
+        // visible end (at most the width clamp's two slack cells and the
+        // right border) are cleared here, by hand — a memset call per
+        // tiny range cost more than the clearing.
         for (ivs.ptr[0..ivs.len]) |iv| {
-            const lo: usize = @intCast(@max(iv.lo, 0));
-            const hi: usize = @intCast(@min(iv.hi, row_x_max));
-            if (lo < hi) @memset(acc[lo..hi], 0.0);
+            var c: i32 = @max(iv.lo, x_end);
+            const hi: i32 = @min(iv.hi, row_x_max);
+            while (c < hi) : (c += 1) acc[@intCast(c)] = 0.0;
         }
     }
 }
@@ -2124,6 +2143,8 @@ pub const SweepScratch = struct {
             if (self.accum.len > 0) allocator.free(self.accum);
             self.accum = &.{};
             self.accum = try allocator.alloc(f64, w + accum_slack);
+            // Zero once: the sweeps keep it zero (see sweepAnalytic).
+            @memset(self.accum, 0.0);
         }
         if (self.cov.len < w) {
             if (self.cov.len > 0) allocator.free(self.cov);
@@ -2252,6 +2273,7 @@ test "spans replay the direct fill byte for byte: 32 seeded paths, whole-pixel o
     defer a.free(via);
     const accum = try a.alloc(f64, W + accum_slack);
     defer a.free(accum);
+    @memset(accum, 0.0);
     const cov = try a.alloc(u8, W);
     defer a.free(cov);
     const solid = try a.alloc(u8, 8192);
@@ -2312,6 +2334,7 @@ test "spans of a path crossing the canvas border stay within one LSB of the dire
     defer a.free(via);
     const accum = try a.alloc(f64, W + accum_slack);
     defer a.free(accum);
+    @memset(accum, 0.0);
     const cov = try a.alloc(u8, W);
     defer a.free(cov);
     const solid = try a.alloc(u8, 8192);
@@ -2363,6 +2386,7 @@ test "stroke spans replay the direct stroke, under a box clip and a mask" {
     defer a.free(via);
     const accum = try a.alloc(f64, W + accum_slack);
     defer a.free(accum);
+    @memset(accum, 0.0);
     const cov = try a.alloc(u8, W);
     defer a.free(cov);
     const solid = try a.alloc(u8, 4096);
@@ -2483,6 +2507,7 @@ test "coverage goldens and the analytic tolerance: 32 seeded paths through fillP
     defer a.free(mask_ref);
     const accum = try a.alloc(f64, W + accum_slack);
     defer a.free(accum);
+    @memset(accum, 0.0);
     const cov = try a.alloc(u8, W);
     defer a.free(cov);
     var h_ss = std.hash.Wyhash.init(0);
@@ -2562,6 +2587,7 @@ test "stroke: repeated points change nothing, and a hairline with a zero-length 
     defer a.free(ref);
     const accum = try a.alloc(f64, W + accum_slack);
     defer a.free(accum);
+    @memset(accum, 0.0);
     const cov = try a.alloc(u8, W);
     defer a.free(cov);
     const paint: SmPaint = .{ .shader = .{ .solid = 0xFF2040E0 }, .style = .stroke, .stroke_width = 1.0, .blend_mode = .src_over };
@@ -2618,6 +2644,7 @@ test "stroke inner join: a closed hairline folding back on itself stays inside i
     defer a.free(pixels);
     const accum = try a.alloc(f64, W + accum_slack);
     defer a.free(accum);
+    @memset(accum, 0.0);
     const cov = try a.alloc(u8, W);
     defer a.free(cov);
     const paint: SmPaint = .{ .shader = .{ .solid = 0xFF2040E0 }, .style = .stroke, .stroke_width = 1.0, .blend_mode = .src_over };

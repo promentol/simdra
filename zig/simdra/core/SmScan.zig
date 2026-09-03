@@ -1512,10 +1512,22 @@ fn strokePolyline(
                 // Bevel or round join: the OUTER side gets two outline
                 // points (entrance + exit perpendicular), with an arc fan
                 // filling the gap for round. The INNER side keeps a single
-                // miter point so the outline polygon stays simple.
+                // miter point so the outline polygon stays simple — but
+                // only while that point lies on both adjacent segments.
+                // The inner offset lines meet at the miter tip, half_w /
+                // cos(θ/2) from the vertex; when a segment is shorter than
+                // that (a curve flattened into short pieces, or a path
+                // folding back on itself, where the tip runs to infinity)
+                // the tip pokes past the outer strand and the nonzero rule
+                // paints the excursion as a spike. Skia's stroker pivots
+                // the inner side through the vertex in that case; so do we.
                 const safe_denom = if (denom > 1e-9) denom else 1e-9;
                 const sum = v2add(np, nn);
                 const miter = v2scale(sum, 1.0 / safe_denom);
+                const idx_prev: usize = if (i == 0) n - 1 else i - 1;
+                const idx_next: usize = if (i == n - 1) 0 else i + 1;
+                const seg_min_sq = @min(v2lenSq(v2sub(pts[i], pts[idx_prev])), v2lenSq(v2sub(pts[idx_next], pts[i])));
+                const inner_pivot = v2lenSq(miter) > seg_min_sq;
 
                 // Which side is OUTER follows the turn: with
                 // `perp(d) = (-d.y, d.x)`, the +perp ('left') side is the
@@ -1529,9 +1541,21 @@ fn strokePolyline(
                         try emitArcFan(&left_pts, allocator, pts[i], np, nn, half_w, -1.0);
                     }
                     try left_pts.append(allocator, v2add(pts[i], nn));
-                    try right_pts.append(allocator, v2add(pts[i], v2scale(miter, -1)));
+                    if (inner_pivot) {
+                        try right_pts.append(allocator, v2add(pts[i], v2scale(np, -1)));
+                        try right_pts.append(allocator, pts[i]);
+                        try right_pts.append(allocator, v2add(pts[i], v2scale(nn, -1)));
+                    } else {
+                        try right_pts.append(allocator, v2add(pts[i], v2scale(miter, -1)));
+                    }
                 } else {
-                    try left_pts.append(allocator, v2add(pts[i], miter));
+                    if (inner_pivot) {
+                        try left_pts.append(allocator, v2add(pts[i], np));
+                        try left_pts.append(allocator, pts[i]);
+                        try left_pts.append(allocator, v2add(pts[i], nn));
+                    } else {
+                        try left_pts.append(allocator, v2add(pts[i], miter));
+                    }
                     const np_neg: Vec2 = .{ .x = -np.x, .y = -np.y };
                     const nn_neg: Vec2 = .{ .x = -nn.x, .y = -nn.y };
                     try right_pts.append(allocator, v2add(pts[i], np_neg));
@@ -2157,4 +2181,57 @@ test "stroke: repeated points change nothing, and a hairline with a zero-length 
     const reach: u32 = 6;
     try std.testing.expect(x_min + reach >= 10 and x_max <= 80 + reach);
     try std.testing.expect(y_min + reach >= 12 and y_max <= 50 + reach);
+}
+
+test "stroke inner join: a closed hairline folding back on itself stays inside its geometry" {
+    // Regression: the inner side of a round join took the unclamped miter
+    // point. Where the closing segment reversed the last flattened piece
+    // of a curve almost exactly, that point landed 45 px away and the
+    // nonzero rule painted the excursion as a spike (Journe Yofj morph
+    // shape 126 in handyflash). The device-space path is the one the
+    // renderer handed the canvas.
+    const a = std.testing.allocator;
+    const W: u32 = 176;
+    const H: u32 = 208;
+    const pixels = try a.alloc(u32, W * H);
+    defer a.free(pixels);
+    const accum = try a.alloc(f32, W + accum_slack);
+    defer a.free(accum);
+    const cov = try a.alloc(u8, W);
+    defer a.free(cov);
+    const paint: SmPaint = .{ .shader = .{ .solid = 0xFF2040E0 }, .style = .stroke, .stroke_width = 1.0, .blend_mode = .src_over };
+    // Device-space path exactly as the renderer handed it to the canvas
+    // (twips through the object's CTM); the closed hairline revisits its
+    // start point (155.99, 166.28) mid-way.
+    var path = SmPath.emptyWithAllocator(a);
+    defer path.deinit();
+    path.moveTo(155.9885, 166.2813);
+    path.lineTo(155.9981, 167.3251);
+    path.quadraticCurveTo(159.5727, 167.6928, 162.8963, 169.7895);
+    path.quadraticCurveTo(162.4372, 167.6509, 155.9885, 166.2813);
+    path.lineTo(155.9981, 167.3251);
+    path.quadraticCurveTo(159.5727, 167.6928, 162.8963, 169.7895);
+    path.closePath();
+    @memset(pixels, 0);
+    try strokePath(a, pixels, W, H, &path, 1.0, .round, .round, 10.0, &.{}, 0, null, &paint, accum, cov);
+    var x_min: u32 = W;
+    var x_max: u32 = 0;
+    var y_min: u32 = H;
+    var y_max: u32 = 0;
+    var n: u32 = 0;
+    for (pixels, 0..) |p, i| {
+        if (p == 0) continue;
+        n += 1;
+        const x: u32 = @intCast(i % W);
+        const y: u32 = @intCast(i / W);
+        x_min = @min(x_min, x);
+        x_max = @max(x_max, x);
+        y_min = @min(y_min, y);
+        y_max = @max(y_max, y);
+    }
+    // Geometry spans x155..163, y166..170; a 1 px stroke may reach one
+    // pixel beyond it and nowhere near the spike's x95 / y136.
+    try std.testing.expect(n > 0 and n < 80);
+    try std.testing.expect(x_min >= 154 and x_max <= 164);
+    try std.testing.expect(y_min >= 165 and y_max <= 171);
 }

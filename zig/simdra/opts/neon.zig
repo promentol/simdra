@@ -148,6 +148,7 @@ pub const blendColorCovBgraU32 = generic.blendColorCovBgraU32;
 pub const blendLuminosityCovBgraU32 = generic.blendLuminosityCovBgraU32;
 pub const swizzleRB = generic.swizzleRB;
 pub const swizzleRBCopyU32 = generic.swizzleRBCopyU32;
+pub const prepareRowU32 = vec_blend.prepareRowU32;
 
 // Flash (SWF) blend modes — subtract/invert/alpha/erase (PlaceObject3).
 pub const blendFlashSubtractU32 = vec_blend.blendFlashSubtractU32;

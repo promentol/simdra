@@ -1564,3 +1564,58 @@ test "colorMatrixU32: identity, invert-with-offset, luma grayscale" {
     // 0.299·100 + 0.587·150 + 0.114·200 = 140.75 → 141 on all three channels.
     try std.testing.expectEqual(@as(u32, 141 | (141 << 8) | (141 << 16) | (255 << 24)), px2[0]);
 }
+
+/// One 8-bit alpha multiply that maps 255 to 255 (see SmBlitter's
+/// modulateAlpha): (a·m + 0x80) with its high byte folded back.
+pub inline fn modAlphaU32(rgba: u32, modulator: u8) u32 {
+    const a: u32 = (rgba >> 24) & 0xFF;
+    const t: u32 = a * @as(u32, modulator) + 0x80;
+    const new_a: u32 = (t + (t >> 8)) >> 8;
+    return (rgba & 0x00FFFFFF) | (new_a << 24);
+}
+
+/// The source row a per-pixel row kernel consumes (SmBlitter's
+/// `prepareSourceRow`): per-paint colour transform (`mult` 8.8 fixed
+/// point, `add`, SWF order, arithmetic shift), surface byte order,
+/// global alpha, coverage and a partial clip folded into the alpha, in
+/// that order; `keep[i]` = 0 where the clip is 0, 255 otherwise.
+/// `src_out` may alias `src_in`.
+pub fn prepareRowU32(
+    src_out: []u32,
+    keep: []u8,
+    src_in: []const u32,
+    coverage: ?[]const u8,
+    has_cxform: bool,
+    mult: [4]i16,
+    add: [4]i16,
+    bgra: bool,
+    ga: u8,
+    clip_row: ?[]const u8,
+) void {
+    for (src_in, 0..) |s0, i| {
+        var s = s0;
+        if (has_cxform) {
+            var out: u32 = 0;
+            inline for (0..4) |ch| {
+                const c: i32 = @intCast((s >> (8 * ch)) & 0xFF);
+                const v = ((c * @as(i32, mult[ch])) >> 8) + @as(i32, add[ch]);
+                const clamped: u32 = @intCast(std.math.clamp(v, 0, 255));
+                out |= clamped << (8 * ch);
+            }
+            s = out;
+        }
+        if (bgra) s = swizzleRB(s);
+        if (ga != 0xFF) s = modAlphaU32(s, ga);
+        if (coverage) |cov| s = modAlphaU32(s, cov[i]);
+        var k: u8 = 255;
+        if (clip_row) |cr| {
+            if (cr[i] == 0) {
+                k = 0;
+            } else if (cr[i] != 0xFF) {
+                s = modAlphaU32(s, cr[i]);
+            }
+        }
+        src_out[i] = s;
+        keep[i] = k;
+    }
+}

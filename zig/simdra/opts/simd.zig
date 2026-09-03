@@ -106,6 +106,7 @@ pub const blendColorCovBgraU32 = backend.blendColorCovBgraU32;
 pub const blendLuminosityCovBgraU32 = backend.blendLuminosityCovBgraU32;
 pub const swizzleRB = backend.swizzleRB;
 pub const swizzleRBCopyU32 = backend.swizzleRBCopyU32;
+pub const prepareRowU32 = backend.prepareRowU32;
 
 // Flash (SWF) blend modes — subtract/invert/alpha/erase (PlaceObject3).
 pub const blendFlashSubtractU32 = backend.blendFlashSubtractU32;

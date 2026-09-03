@@ -218,7 +218,12 @@ pub fn blitRowFull(
         simd.fillU32(pixels[start_idx..][0..n], color);
         return;
     }
-    blitRow(pixels, dst_w, x_in, y, n_in, solid_row[0..n_in], paint, clip);
+    // A shader row modulated by 255 is itself (modulateAlpha maps 255 to
+    // 255), so a full run under a gradient or pattern skips the
+    // coverage pass; a solid paint keeps its row of 255s, because the
+    // coverage kernel and the plain kernel round a translucent colour
+    // differently.
+    blitRow(pixels, dst_w, x_in, y, n_in, if (paint.shader == .solid) solid_row[0..n_in] else null, paint, clip);
 }
 
 /// Per-pixel sampler path for `.gradient` / `.pattern` shaders. Walks the
@@ -282,26 +287,18 @@ inline fn prepareSourceRow(
     paint: *const SmPaint,
     clip_row: ?[]const u8,
 ) void {
-    const cxform = !paint.cxform.isIdentity();
-    const bgra = paint.dst_color_type == .bgra8888;
-    const ga = paint.global_alpha;
-    for (src_in, 0..) |s0, i| {
-        var s = s0;
-        if (cxform) s = paint.cxform.apply(s);
-        if (bgra) s = simd.swizzleRB(s);
-        if (ga != 0xFF) s = modulateAlpha(s, ga);
-        if (coverage) |cov| s = modulateAlpha(s, cov[i]);
-        var k: u8 = 255;
-        if (clip_row) |cr| {
-            if (cr[i] == 0) {
-                k = 0;
-            } else if (cr[i] != 0xFF) {
-                s = modulateAlpha(s, cr[i]);
-            }
-        }
-        src_out[i] = s;
-        keep[i] = k;
-    }
+    simd.prepareRowU32(
+        src_out,
+        keep,
+        src_in,
+        coverage,
+        !paint.cxform.isIdentity(),
+        paint.cxform.mult,
+        paint.cxform.add,
+        paint.dst_color_type == .bgra8888,
+        paint.global_alpha,
+        clip_row,
+    );
 }
 
 /// One row-kernel call for a per-pixel source; `mask` 0 skips, 255 takes

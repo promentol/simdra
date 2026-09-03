@@ -483,3 +483,125 @@ pub fn blendAddCovU32(dst: []u32, src_color: u32, cov: []const u8) void {
     }
     if (i < dst.len) generic.blendAddCovU32(dst[i..], src_color, cov[i..]);
 }
+
+// -----------------------------------------------------------------------------
+// prepareRowU32 — generic.zig's per-pixel source preparation, eight
+// pixels per step: colour transform in i32 lanes, R/B swap by shuffle,
+// alpha modulation in u16 lanes. Byte-identical to the scalar kernel
+// (the test below says so over every flag combination).
+// -----------------------------------------------------------------------------
+
+const V32i = @Vector(Px * 4, i32);
+
+const rb_swap_mask: [Px * 4]i32 = blk: {
+    var m: [Px * 4]i32 = undefined;
+    for (0..Px) |p| {
+        m[p * 4 + 0] = @intCast(p * 4 + 2);
+        m[p * 4 + 1] = @intCast(p * 4 + 1);
+        m[p * 4 + 2] = @intCast(p * 4 + 0);
+        m[p * 4 + 3] = @intCast(p * 4 + 3);
+    }
+    break :blk m;
+};
+
+/// (a·m + 0x80) with the high byte folded back, per lane: 255 → 255.
+inline fn modAlpha8(a: V8, m: V8) V8 {
+    const t = a * m + @as(V8, @splat(0x80));
+    return (t + (t >> @splat(8))) >> @splat(8);
+}
+
+inline fn lanePattern4(v: [4]i16) V32i {
+    var arr: [Px * 4]i32 = undefined;
+    for (0..Px * 4) |i| arr[i] = v[i % 4];
+    return arr;
+}
+
+pub fn prepareRowU32(
+    src_out: []u32,
+    keep: []u8,
+    src_in: []const u32,
+    coverage: ?[]const u8,
+    has_cxform: bool,
+    mult: [4]i16,
+    add: [4]i16,
+    bgra: bool,
+    ga: u8,
+    clip_row: ?[]const u8,
+) void {
+    const m4 = lanePattern4(mult);
+    const a4 = lanePattern4(add);
+    const ga8: V8 = @splat(@intCast(ga));
+    var i: usize = 0;
+    while (i + Px <= src_in.len) : (i += Px) {
+        var w = loadW(src_in[i..]);
+        if (has_cxform) {
+            const wi: V32i = @intCast(w);
+            var v = ((wi * m4) >> @splat(8)) + a4;
+            v = @max(@min(v, @as(V32i, @splat(255))), @as(V32i, @splat(0)));
+            w = @intCast(v);
+        }
+        if (bgra) w = @shuffle(u16, w, undefined, rb_swap_mask);
+        var a8 = alphaOf(w);
+        if (ga != 0xFF) a8 = modAlpha8(a8, ga8);
+        if (coverage) |cov| {
+            const c8: V8 = @as(V8, @as(@Vector(Px, u8), cov[i..][0..Px].*));
+            a8 = modAlpha8(a8, c8);
+        }
+        var k8: V8 = @splat(255);
+        if (clip_row) |cr| {
+            const c8: V8 = @as(V8, @as(@Vector(Px, u8), cr[i..][0..Px].*));
+            const zero = c8 == @as(V8, @splat(0));
+            const full = c8 == @as(V8, @splat(255));
+            // The scalar kernel modulates only a partial clip byte; a
+            // zero byte leaves the source alone and clears `keep`.
+            const modded = modAlpha8(a8, c8);
+            a8 = @select(u16, zero, a8, @select(u16, full, a8, modded));
+            k8 = @select(u16, zero, @as(V8, @splat(0)), k8);
+        }
+        w = withAlphaLane(w, bcast4(a8));
+        storeW(src_out[i..], w);
+        keep[i..][0..Px].* = @as(@Vector(Px, u8), @intCast(k8));
+    }
+    if (i < src_in.len) generic.prepareRowU32(
+        src_out[i..],
+        keep[i..],
+        src_in[i..],
+        if (coverage) |c| c[i..] else null,
+        has_cxform,
+        mult,
+        add,
+        bgra,
+        ga,
+        if (clip_row) |c| c[i..] else null,
+    );
+}
+
+test "prepareRowU32: vector == scalar byte for byte over every flag combination" {
+    var prng = std.Random.DefaultPrng.init(0xc0ffee);
+    const r = prng.random();
+    const N = 37; // a tail of 5 past four vector steps
+    var src: [N]u32 = undefined;
+    var cov: [N]u8 = undefined;
+    var clip: [N]u8 = undefined;
+    var out_v: [N]u32 = undefined;
+    var out_g: [N]u32 = undefined;
+    var keep_v: [N]u8 = undefined;
+    var keep_g: [N]u8 = undefined;
+    var combo: u32 = 0;
+    while (combo < 64) : (combo += 1) {
+        for (&src) |*p| p.* = r.int(u32);
+        for (&cov) |*c| c.* = r.int(u8);
+        for (&clip, 0..) |*c, k| c.* = if (k % 5 == 0) 0 else if (k % 7 == 0) 255 else r.int(u8);
+        const mult: [4]i16 = if (combo & 1 != 0) .{ 300, -120, 256, 40 } else .{ 256, 256, 256, 256 };
+        const add: [4]i16 = if (combo & 1 != 0) .{ -30, 90, 0, 255 } else .{ 0, 0, 0, 0 };
+        const has_cx = combo & 1 != 0 or combo & 32 != 0;
+        const bgra = combo & 2 != 0;
+        const ga: u8 = if (combo & 4 != 0) 0x73 else 0xFF;
+        const use_cov = combo & 8 != 0;
+        const use_clip = combo & 16 != 0;
+        prepareRowU32(&out_v, &keep_v, &src, if (use_cov) &cov else null, has_cx, mult, add, bgra, ga, if (use_clip) &clip else null);
+        generic.prepareRowU32(&out_g, &keep_g, &src, if (use_cov) &cov else null, has_cx, mult, add, bgra, ga, if (use_clip) &clip else null);
+        try std.testing.expectEqualSlices(u32, &out_g, &out_v);
+        try std.testing.expectEqualSlices(u8, &keep_g, &keep_v);
+    }
+}

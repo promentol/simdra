@@ -999,6 +999,31 @@ fn clipEdgesToWidth(edges: *const EdgeBuf, allocator: std.mem.Allocator, out: *E
 /// The analytic converter. `emit.run(canvas_w, x, y, cov)` receives every
 /// run of non-zero coverage bytes (the blitter for fills, the mask for
 /// clips). `aa_accum` must have `canvas_w + accum_slack` cells.
+/// The cells one segment's deposit touched, [lo, hi).
+const CellIv = struct { lo: i32, hi: i32 };
+const IvBuf = SmList(CellIv);
+
+/// Insertion sort by `lo`: a row has a handful of segments.
+fn sortIntervals(ivs: []CellIv) void {
+    var i: usize = 1;
+    while (i < ivs.len) : (i += 1) {
+        const v = ivs[i];
+        var j = i;
+        while (j > 0 and ivs[j - 1].lo > v.lo) : (j -= 1) ivs[j] = ivs[j - 1];
+        ivs[j] = v;
+    }
+}
+
+/// The coverage of a prefix sum under the fill rule, quantized as the
+/// walk always did: the sum in f64, the rule in f32.
+inline fn coverageOf(sum: f64, fill_rule: FillRule) f32 {
+    const sum32: f32 = @floatCast(sum);
+    if (fill_rule == .nonzero) return @min(1.0, @abs(sum32));
+    var t = @abs(sum32);
+    t -= 2.0 * @floor(t * 0.5);
+    return if (t > 1.0) 2.0 - t else t;
+}
+
 fn sweepAnalytic(
     edges_in: *EdgeBuf,
     allocator: std.mem.Allocator,
@@ -1043,6 +1068,8 @@ fn sweepAnalytic(
 
     var active: ActiveBuf = .{};
     defer active.deinit(allocator);
+    var ivs: IvBuf = .{};
+    defer ivs.deinit(allocator);
     var next_idx: usize = 0;
 
     var y_int: i32 = y_start;
@@ -1072,9 +1099,11 @@ fn sweepAnalytic(
         }
         if (active.len < 2) continue;
 
-        // Deposit every active edge's segment within this row.
+        // Deposit every active edge's segment within this row, noting
+        // the cells each one touched.
         var row_x_min: i32 = cw_i + @as(i32, accum_slack);
         var row_x_max: i32 = 0;
+        ivs.len = 0;
         for (active.ptr[0..active.len]) |a| {
             const ya = @max(y_top, a.y_min);
             const yb = @min(y_bot, a.y_max);
@@ -1087,6 +1116,7 @@ fn sweepAnalytic(
             const hi_i: i32 = @as(i32, @intFromFloat(@ceil(@max(xa64, xb64)))) + 2;
             if (lo_i < row_x_min) row_x_min = lo_i;
             if (hi_i > row_x_max) row_x_max = hi_i;
+            try ivs.append(allocator, .{ .lo = lo_i, .hi = hi_i });
         }
         if (row_x_min >= row_x_max) continue;
         row_x_max = @min(row_x_max, cw_i + @as(i32, accum_slack));
@@ -1100,30 +1130,62 @@ fn sweepAnalytic(
         // a coverage byte: the same shape swept at another offset (see
         // sweepToSpans) quantizes to the same bytes. The quantization
         // itself stays in f32, as it always was.
+        //
+        // Only the cells a segment touched are walked; between two
+        // touched intervals nothing was deposited, the sum is what it
+        // was, and every cell there takes the same byte — the interior
+        // of a wide fill is a memset, not a walk. The bytes and the run
+        // boundaries are exactly the walk's.
+        sortIntervals(ivs.ptr[0..ivs.len]);
         var sum: f64 = 0.0;
         var x: i32 = row_x_min;
         var run_start: i32 = -1;
-        while (x < x_end) : (x += 1) {
-            sum += acc[@intCast(x)];
-            const sum32: f32 = @floatCast(sum);
-            var cov: f32 = undefined;
-            if (fill_rule == .nonzero) {
-                cov = @min(1.0, @abs(sum32));
-            } else {
-                var t = @abs(sum32);
-                t -= 2.0 * @floor(t * 0.5);
-                cov = if (t > 1.0) 2.0 - t else t;
+        var iv_i: usize = 0;
+        while (x < x_end) {
+            // The next touched interval at or past x, merged with the
+            // ones overlapping it.
+            while (iv_i < ivs.len and ivs.ptr[iv_i].hi <= x) iv_i += 1;
+            var seg_lo: i32 = x_end;
+            var seg_hi: i32 = x_end;
+            if (iv_i < ivs.len) {
+                seg_lo = @max(x, ivs.ptr[iv_i].lo);
+                seg_hi = ivs.ptr[iv_i].hi;
+                var m_i = iv_i + 1;
+                while (m_i < ivs.len and ivs.ptr[m_i].lo <= seg_hi) : (m_i += 1) seg_hi = @max(seg_hi, ivs.ptr[m_i].hi);
+                iv_i = m_i;
             }
-            const v = cov * 256.0;
-            if (v < 1.0) {
-                if (run_start >= 0) {
-                    emit.run(canvas_w, run_start, y_int, cov_row[@intCast(run_start)..@intCast(x)]);
-                    run_start = -1;
+            seg_lo = @min(seg_lo, x_end);
+            seg_hi = @min(seg_hi, x_end);
+            if (seg_lo > x) {
+                // Gap [x, seg_lo): constant coverage.
+                const cov = coverageOf(sum, fill_rule);
+                const v = cov * 256.0;
+                if (v < 1.0) {
+                    if (run_start >= 0) {
+                        emit.run(canvas_w, run_start, y_int, cov_row[@intCast(run_start)..@intCast(x)]);
+                        run_start = -1;
+                    }
+                } else {
+                    if (run_start < 0) run_start = x;
+                    const byte: u8 = if (v >= 255.0) 255 else @intFromFloat(v);
+                    @memset(cov_row[@intCast(x)..@intCast(seg_lo)], byte);
                 }
-                continue;
+                x = seg_lo;
             }
-            if (run_start < 0) run_start = x;
-            cov_row[@intCast(x)] = if (v >= 255.0) 255 else @intFromFloat(v);
+            while (x < seg_hi) : (x += 1) {
+                sum += acc[@intCast(x)];
+                const cov = coverageOf(sum, fill_rule);
+                const v = cov * 256.0;
+                if (v < 1.0) {
+                    if (run_start >= 0) {
+                        emit.run(canvas_w, run_start, y_int, cov_row[@intCast(run_start)..@intCast(x)]);
+                        run_start = -1;
+                    }
+                    continue;
+                }
+                if (run_start < 0) run_start = x;
+                cov_row[@intCast(x)] = if (v >= 255.0) 255 else @intFromFloat(v);
+            }
         }
         if (run_start >= 0) emit.run(canvas_w, run_start, y_int, cov_row[@intCast(run_start)..@intCast(x_end)]);
         @memset(acc[@intCast(row_x_min)..@intCast(row_x_max)], 0.0);

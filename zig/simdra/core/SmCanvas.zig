@@ -324,6 +324,9 @@ pub fn deinit(self: *SmCanvas) void {
         self.surface.getAllocator().free(s);
         self.aa_coverage = null;
     }
+    if (self.solid_row) |s| self.surface.getAllocator().free(s);
+    self.solid_row = null;
+    self.sweep_scratch.deinit(self.surface.getAllocator());
 }
 
 /// ensureAaScratch — lazy allocator for the AA path fill scratches.
@@ -344,8 +347,6 @@ fn ensureAaScratch(self: *SmCanvas) ?struct { accum: []f64, cov: []u8 } {
     }
     if (self.aa_coverage == null or self.aa_coverage.?.len < w) {
         if (self.aa_coverage) |s| allocator.free(s);
-    if (self.solid_row) |s| allocator.free(s);
-    self.sweep_scratch.deinit(allocator);
         self.aa_coverage = allocator.alloc(u8, w) catch {
             self.aa_coverage = null;
             return null;

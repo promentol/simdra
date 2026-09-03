@@ -2235,6 +2235,7 @@ test "spans of a path crossing the canvas border stay within one LSB of the dire
             }
         }
     }
+    std.debug.print("\nborder spans vs direct: {d} px differ, worst {d} LSB\n", .{ differing, worst });
     try std.testing.expect(worst <= 1);
     // A handful of border cells at most, over 32 × 16k pixels.
     try std.testing.expect(differing < 64);

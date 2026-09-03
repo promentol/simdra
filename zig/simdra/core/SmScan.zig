@@ -999,6 +999,50 @@ fn clipEdgesToWidth(edges: *const EdgeBuf, allocator: std.mem.Allocator, out: *E
 /// The analytic converter. `emit.run(canvas_w, x, y, cov)` receives every
 /// run of non-zero coverage bytes (the blitter for fills, the mask for
 /// clips). `aa_accum` must have `canvas_w + accum_slack` cells.
+/// innerBox — the largest box the caller may treat as unmasked: rows
+/// forming the longest contiguous run with a 255 cell, intersected with
+/// each of those rows' outermost 255 cells. Every byte inside is 255,
+/// so a blit there multiplies by 255 — the identity — and can skip the
+/// mask (SmBlitter.blitRow does). A rectangle mask at fractional
+/// coordinates, the common Flash masker, yields its whole interior.
+pub fn innerBox(mask: []const u8, w: usize, box: RowBox) RowBox {
+    var best: RowBox = .{};
+    var cur: RowBox = .{};
+    var y = box.y0;
+    while (y <= box.y1) : (y += 1) {
+        var lo: i32 = -1;
+        var hi: i32 = -1;
+        if (y < box.y1) {
+            const row = mask[@as(usize, @intCast(y)) * w ..];
+            var x = box.x0;
+            while (x < box.x1) : (x += 1) {
+                if (row[@intCast(x)] == 255) {
+                    lo = x;
+                    break;
+                }
+            }
+            if (lo >= 0) {
+                x = box.x1;
+                while (x > lo) : (x -= 1) {
+                    if (row[@intCast(x - 1)] == 255) {
+                        hi = x;
+                        break;
+                    }
+                }
+            }
+        }
+        if (lo >= 0 and !cur.isEmpty() and lo < cur.x1 and hi > cur.x0) {
+            cur.x0 = @max(cur.x0, lo);
+            cur.x1 = @min(cur.x1, hi);
+            cur.y1 = y + 1;
+        } else {
+            if (!cur.isEmpty() and (best.isEmpty() or (cur.x1 - cur.x0) * (cur.y1 - cur.y0) > (best.x1 - best.x0) * (best.y1 - best.y0))) best = cur;
+            cur = if (lo >= 0) .{ .x0 = lo, .y0 = y, .x1 = hi, .y1 = y + 1 } else .{};
+        }
+    }
+    return best;
+}
+
 /// The cells one segment's deposit touched, [lo, hi).
 const CellIv = struct { lo: i32, hi: i32 };
 const IvBuf = SmList(CellIv);

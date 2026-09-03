@@ -58,6 +58,12 @@ pub const Clip = struct {
     y0: i32,
     x1: i32,
     y1: i32,
+    /// Inside this box every mask byte is 255 (see SmScan.innerBox): a
+    /// run within it is blended as if the clip were the box alone.
+    ix0: i32 = 0,
+    iy0: i32 = 0,
+    ix1: i32 = 0,
+    iy1: i32 = 0,
 
     pub inline fn excludes(self: Clip, x_start: i32, y: i32, n: u32) bool {
         return y < self.y0 or y >= self.y1 or x_start >= self.x1 or
@@ -99,6 +105,7 @@ pub fn blitRow(
             x_start = lo;
         }
         mask = c.mask;
+        if (mask != null and y >= c.iy0 and y < c.iy1 and x_start >= c.ix0 and x_start + @as(i32, @intCast(n)) <= c.ix1) mask = null;
     }
     const start_idx: usize =
         @as(usize, @intCast(y)) * @as(usize, dst_w) +

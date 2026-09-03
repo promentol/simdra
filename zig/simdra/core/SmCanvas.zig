@@ -60,6 +60,7 @@ pub const StateFrame = struct {
     clipOwned: bool,
     clipBox: SmScan.RowBox,
     clipRectOnly: bool,
+    clipInner: SmScan.RowBox,
     alpha: u8,
     blendMode: SmPaint.BlendMode,
     cxform: SmPaint.ColorTransform,
@@ -162,6 +163,8 @@ clip_box: SmScan.RowBox = .{},
 /// scrollRect, mask bound and layer bound is — with no mask allocated.
 /// Only `clip_box` is consulted; `clip_mask` is null.
 clip_rect_only: bool = false,
+/// Where the clip mask is all 255 (SmScan.innerBox); empty without a mask.
+clip_inner: SmScan.RowBox = .{},
 /// HTML5 `imageSmoothingEnabled`. Default true — drawImage uses bilinear
 /// sampling. When false, drawImage uses nearest-neighbor (blocky scale-up).
 imageSmoothingEnabled: bool = true,
@@ -455,6 +458,7 @@ pub fn reset(self: *SmCanvas) void {
     self.clip_owned = true;
     self.clip_box = .{};
     self.clip_rect_only = false;
+    self.clip_inner = .{};
     self.line_dash_storage.len = 0;
     self.filter_verbs.len = 0;
     self.filter_params.len = 0;
@@ -654,6 +658,7 @@ pub fn save(self: *SmCanvas) void {
         .clipOwned = saved_clip_owned,
         .clipBox = self.clip_box,
         .clipRectOnly = self.clip_rect_only,
+        .clipInner = self.clip_inner,
         .alpha = self.alpha,
         .blendMode = self.blendMode,
         .cxform = self.cxform,
@@ -702,6 +707,7 @@ pub fn restore(self: *SmCanvas) void {
     self.clip_owned = frame.clipOwned;
     self.clip_box = frame.clipBox;
     self.clip_rect_only = frame.clipRectOnly;
+    self.clip_inner = frame.clipInner;
     self.alpha = frame.alpha;
     self.blendMode = frame.blendMode;
     self.cxform = frame.cxform;
@@ -1901,7 +1907,17 @@ pub fn clipPath(self: *SmCanvas, path: *const SmPath, fill_rule: SmScan.FillRule
 /// The active clip as the blitter sees it: mask plus box.
 pub fn clipRef(self: *const SmCanvas) ?SmBlitter.Clip {
     if (self.clip_mask == null and !self.clip_rect_only) return null;
-    return .{ .mask = self.clip_mask, .x0 = self.clip_box.x0, .y0 = self.clip_box.y0, .x1 = self.clip_box.x1, .y1 = self.clip_box.y1 };
+    return .{
+        .mask = self.clip_mask,
+        .x0 = self.clip_box.x0,
+        .y0 = self.clip_box.y0,
+        .x1 = self.clip_box.x1,
+        .y1 = self.clip_box.y1,
+        .ix0 = self.clip_inner.x0,
+        .iy0 = self.clip_inner.y0,
+        .ix1 = self.clip_inner.x1,
+        .iy1 = self.clip_inner.y1,
+    };
 }
 
 /// Whether any clip is active (a mask or a box).
@@ -1913,10 +1929,13 @@ pub fn hasClip(self: *const SmCanvas) bool {
 /// an earlier `clip()` whose geometry has not changed — intersected
 /// with the active clip. The mask is BORROWED (never freed here, never
 /// mutated) unless an intersection with an existing mask has to build
-/// a new one. `box` is the box of its non-zero bytes.
-pub fn clipWithMask(self: *SmCanvas, mask: []u8, box: SmScan.RowBox) void {
+/// a new one. `box` is the box of its non-zero bytes; `inner_opt` its
+/// all-255 interior when the caller kept it (SmScan.innerBox), else
+/// it is scanned here.
+pub fn clipWithMask(self: *SmCanvas, mask: []u8, box: SmScan.RowBox, inner_opt: ?SmScan.RowBox) void {
     const allocator = self.surface.getAllocator();
     const w: usize = self.surface.width;
+    const inner = inner_opt orelse SmScan.innerBox(mask, w, box);
     if (self.clip_mask) |existing| {
         const total: usize = w * @as(usize, self.surface.height);
         const inter = box.intersect(self.clip_box);
@@ -1934,10 +1953,12 @@ pub fn clipWithMask(self: *SmCanvas, mask: []u8, box: SmScan.RowBox) void {
         self.clip_owned = true;
         self.clip_box = inter;
         self.clip_rect_only = false;
+        self.clip_inner = inner.intersect(self.clip_inner);
         return;
     }
     self.clip_mask = mask;
     self.clip_owned = false;
+    self.clip_inner = if (self.clip_rect_only) inner.intersect(self.clip_box) else inner;
     self.clip_box = if (self.clip_rect_only) box.intersect(self.clip_box) else box;
     self.clip_rect_only = false;
 }
@@ -1980,6 +2001,7 @@ fn clipInternal(self: *SmCanvas, path: *const SmPath, fill_rule: SmScan.FillRule
     if (self.integerRect(path)) |r| {
         self.clip_box = if (self.hasClip()) self.clip_box.intersect(r) else r;
         if (self.clip_mask == null) self.clip_rect_only = true;
+        self.clip_inner = self.clip_inner.intersect(r);
         return;
     }
     // Rasterize the new clip path into a fresh zeroed buffer.
@@ -2002,6 +2024,9 @@ fn clipInternal(self: *SmCanvas, path: *const SmPath, fill_rule: SmScan.FillRule
             return;
         };
     }
+    // The new mask's own interior, before it is combined: the combined
+    // interior is the intersection (255 × 255 is the only way to 255).
+    var inner = SmScan.innerBox(new_mask, w, box);
     if (self.clip_mask) |existing| {
         // Intersect multiplicatively (`(a * b + 127) / 255`, the formula
         // `SmBlitter.blitRow` composes coverage with), but only inside
@@ -2016,14 +2041,17 @@ fn clipInternal(self: *SmCanvas, path: *const SmPath, fill_rule: SmScan.FillRule
             simd.clipCombineU8(new_mask[lo..hi], new_mask[lo..hi], existing[lo..hi]);
         }
         box = box.intersect(self.clip_box);
+        inner = inner.intersect(self.clip_inner);
         if (self.clip_owned) allocator.free(existing);
     } else if (self.clip_rect_only) {
         box = box.intersect(self.clip_box);
+        inner = inner.intersect(self.clip_box);
     }
     self.clip_mask = new_mask;
     self.clip_owned = true;
     self.clip_box = box;
     self.clip_rect_only = false;
+    self.clip_inner = inner;
 }
 
 // --- HTML5-shaped sugar (build a SmPaint from current ctx state) ---------
@@ -2954,7 +2982,7 @@ test "clipWithMask: a kept mask is borrowed, intersects a box, and combines with
     defer sa.deinit();
     var a = SmCanvas.initFromSurface(&sa);
     defer a.deinit();
-    a.clipWithMask(kept, kept_box);
+    a.clipWithMask(kept, kept_box, null);
     try std.testing.expect(!a.clip_owned);
     try std.testing.expect(a.clip_mask.?.ptr == kept.ptr);
     fillTestShape(&a);
@@ -2968,7 +2996,7 @@ test "clipWithMask: a kept mask is borrowed, intersects a box, and combines with
     b.beginPath();
     b.rect(10, 5, 20, 12);
     b.clip(.nonzero);
-    b.clipWithMask(kept, kept_box);
+    b.clipWithMask(kept, kept_box, null);
     try std.testing.expect(!b.clip_owned);
     try std.testing.expectEqual(kept_box.intersect(.{ .x0 = 10, .y0 = 5, .x1 = 30, .y1 = 17 }), b.clip_box);
     fillTestShape(&b);
@@ -2995,7 +3023,7 @@ test "clipWithMask: a kept mask is borrowed, intersects a box, and combines with
     var d = SmCanvas.initFromSurface(&sd);
     defer d.deinit();
     clipRectViaPath(&d, 0.5, 0, 25, 25);
-    d.clipWithMask(kept, kept_box);
+    d.clipWithMask(kept, kept_box, null);
     try std.testing.expect(d.clip_owned);
     try std.testing.expect(d.clip_mask.?.ptr != kept.ptr);
 }

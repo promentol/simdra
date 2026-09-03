@@ -179,6 +179,48 @@ pub fn blitRow(
     dispatchSolid(row, paint, paint.dst_color_type);
 }
 
+/// blitRowFull — a run of FULL coverage (a cached span's solid run).
+/// An opaque solid paint under src_over / src / copy with no clip mask
+/// is a plain fill: the coverage kernel with cov = 255 and alpha = 255
+/// lands on the source colour exactly (mul255(x, 255) = x), so the
+/// bytes are those of `blitRow` with a row of 255s. Everything else
+/// goes through `blitRow` with `solid_row` (at least `n` bytes of 255).
+pub fn blitRowFull(
+    pixels: []u32,
+    dst_w: u32,
+    x_in: i32,
+    y: i32,
+    n_in: u32,
+    paint: *const SmPaint,
+    clip: ?Clip,
+    solid_row: []const u8,
+) void {
+    if (n_in == 0) return;
+    fast: {
+        if (paint.shader != .solid) break :fast;
+        switch (paint.blend_mode) {
+            .src_over, .src, .copy => {},
+            else => break :fast,
+        }
+        const color = resolveSolid(paint);
+        if ((color >> 24) != 0xFF) break :fast;
+        var x_start = x_in;
+        var n = n_in;
+        if (clip) |c| {
+            if (c.mask != null) break :fast;
+            if (c.excludes(x_in, y, n_in)) return;
+            const lo = @max(x_in, c.x0);
+            const hi = @min(x_in + @as(i32, @intCast(n_in)), c.x1);
+            x_start = lo;
+            n = @intCast(hi - lo);
+        }
+        const start_idx: usize = @as(usize, @intCast(y)) * @as(usize, dst_w) + @as(usize, @intCast(x_start));
+        simd.fillU32(pixels[start_idx..][0..n], color);
+        return;
+    }
+    blitRow(pixels, dst_w, x_in, y, n_in, solid_row[0..n_in], paint, clip);
+}
+
 /// Per-pixel sampler path for `.gradient` / `.pattern` shaders. Walks the
 /// destination row, samples the shader at each pixel center, applies
 /// `paint.global_alpha` and (optionally) the coverage byte to the source

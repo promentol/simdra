@@ -126,9 +126,9 @@ fn noteRun(self: *SmSpans, x: i32, y: i32, len: u32) void {
 
 /// Blend every run into `pixels` (a `dst_w` × `dst_h` surface), shifted
 /// by (`dx`, `dy`), through `blitRow` with `paint` under `clip`.
-/// `solid_row` is at least `max_run` bytes of 255 (a solid run is blended
-/// with the same coverage kernel as an inline one, so the bytes match a
-/// direct sweep exactly).
+/// `solid_row` is at least `max_run` bytes of 255: a solid run is blended
+/// with the same coverage kernel as an inline one (or, for an opaque
+/// solid paint, filled — the same bytes, see `SmBlitter.blitRowFull`).
 pub fn replay(
     self: *const SmSpans,
     pixels: []u32,
@@ -158,8 +158,11 @@ pub fn replay(
         if (y < c.y0 or y >= c.y1) continue;
         const x = r.x + dx;
         if (x >= c.x1 or x + @as(i32, @intCast(r.len)) <= c.x0) continue;
-        const cov: []const u8 = if (r.cov == SOLID) solid_row[0..r.len] else bytes[r.cov..][0..r.len];
-        SmBlitter.blitRow(pixels, dst_w, x, y, r.len, cov, paint, c);
+        if (r.cov == SOLID) {
+            SmBlitter.blitRowFull(pixels, dst_w, x, y, r.len, paint, c, solid_row);
+        } else {
+            SmBlitter.blitRow(pixels, dst_w, x, y, r.len, bytes[r.cov..][0..r.len], paint, c);
+        }
     }
 }
 

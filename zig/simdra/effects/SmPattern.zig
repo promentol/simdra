@@ -262,6 +262,32 @@ fn sampleNearestRow(self: *const SmPattern, x_start: f64, ka: f64, kb: f64, cy_e
     var ax = Axis4.initAt(ka * 0.5 + cy_e, ka, x0, self.width, tile_x) orelse return self.sampleNearestRowScalar(x_start, ka, kb, cy_e, dy_f, out);
     var ay = Axis4.initAt(kb * 0.5 + dy_f, kb, x0, self.height, tile_y) orelse return self.sampleNearestRowScalar(x_start, ka, kb, cy_e, dy_f, out);
     const w: usize = self.width;
+    // A bitmap drawn at its own scale along the row (the common Flash
+    // tile): fx(1.0) is exactly 2^32 and fx(0.0) is 0, so the lanes
+    // above would step through consecutive texels of one texel row —
+    // which is a copy. Same indices, no per-pixel gather.
+    if (ka == 1.0 and kb == 0.0 and ay.base >= 0 and ay.base < ay.n) {
+        const iy: usize = @intCast(ay.base >> 32);
+        const row_base = iy * w * 4;
+        var ix: i64 = ax.base >> 32;
+        var i: usize = 0;
+        if (tile_x) {
+            while (i < out.len) {
+                if (ix >= @as(i64, @intCast(w))) ix -= @intCast(w);
+                const run = @min(out.len - i, w - @as(usize, @intCast(ix)));
+                const src = self.data[row_base + @as(usize, @intCast(ix)) * 4 ..][0 .. run * 4];
+                @memcpy(std.mem.sliceAsBytes(out[i..][0..run]), src);
+                i += run;
+                ix += @intCast(run);
+            }
+        } else {
+            while (i < out.len) : (i += 1) {
+                const xx = ix + @as(i64, @intCast(i));
+                out[i] = if (xx < 0 or xx >= @as(i64, @intCast(w))) 0 else @bitCast(self.data[row_base + @as(usize, @intCast(xx)) * 4 ..][0..4].*);
+            }
+        }
+        return;
+    }
     var i: usize = 0;
     // The tail takes the same fixed-point lanes as the body (a pixel
     // must not sample differently for being last in its run).

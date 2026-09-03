@@ -115,7 +115,7 @@ pub fn blitRow(
     switch (paint.shader) {
         .solid => {},
         .gradient, .pattern => {
-            dispatchShader(row, x_start, y, coverage, paint, clip_row);
+            dispatchShader(row, x_start, y, coverage, paint, clip_row, x_in, n_in);
             return;
         },
     }
@@ -192,29 +192,52 @@ inline fn dispatchShader(
     coverage: ?[]const u8,
     paint: *const SmPaint,
     clip_row: ?[]const u8,
+    /// The run as the scan converter emitted it, before the clip box
+    /// trimmed it to `row` (`full_x <= x_start`, `full_n >= row.len`).
+    full_x: i32,
+    full_n: u32,
 ) void {
     // Sample the shader into a source row, modulate it once, blend the
     // row with ONE kernel call. The per-pixel version this replaced
     // (`dispatchShaderReference`, kept for the test) built a one-pixel
     // paint and ran the 27-way blend switch for every pixel.
+    //
+    // The sampling walks the UNTRIMMED run: the row samplers step in f32
+    // lanes from the run's first pixel, so where a run starts decides
+    // the last bit of every pixel in it, and a run trimmed by a clip box
+    // has to yield the same bytes inside the box as the same run
+    // unclipped (a partial repaint under a box clip must be invisible).
     const py: f64 = @as(f64, @floatFromInt(y)) + 0.5;
     var src_stack: [ROW_CHUNK]u32 = undefined;
     var keep_stack: [ROW_CHUNK]u8 = undefined;
+    const skip: usize = @intCast(x_start - full_x);
+    const vis_end: usize = skip + row.len;
     var off: usize = 0;
-    while (off < row.len) {
-        const n = @min(row.len - off, ROW_CHUNK);
+    while (off < full_n) {
+        const n = @min(full_n - off, ROW_CHUNK);
+        const chunk_end = off + n;
+        if (chunk_end <= skip or off >= vis_end) {
+            off = chunk_end;
+            continue;
+        }
         const src = src_stack[0..n];
-        const px0: f64 = @as(f64, @floatFromInt(x_start + @as(i32, @intCast(off)))) + 0.5;
+        const px0: f64 = @as(f64, @floatFromInt(full_x + @as(i32, @intCast(off)))) + 0.5;
         switch (paint.shader) {
             .gradient => |g| g.sampleRow(px0, py, src),
             .pattern => |pat| pat.sampleRow(px0, py, src),
             .solid => unreachable,
         }
-        const cov_slice: ?[]const u8 = if (coverage) |c| c[off..][0..n] else null;
-        const clip_slice: ?[]const u8 = if (clip_row) |c| c[off..][0..n] else null;
-        prepareSourceRow(src, keep_stack[0..n], src, cov_slice, paint, clip_slice);
-        dispatchRowSrc(row[off..][0..n], src, if (clip_row != null) keep_stack[0..n] else null, paint.blend_mode, paint.dst_color_type);
-        off += n;
+        // The visible part of this chunk, chunk-relative and row-relative.
+        const a = @max(off, skip) - off;
+        const b = @min(chunk_end, vis_end) - off;
+        const ra = off + a - skip;
+        const rb = off + b - skip;
+        const vis = src[a..b];
+        const cov_slice: ?[]const u8 = if (coverage) |c| c[ra..rb] else null;
+        const clip_slice: ?[]const u8 = if (clip_row) |c| c[ra..rb] else null;
+        prepareSourceRow(vis, keep_stack[0 .. b - a], vis, cov_slice, paint, clip_slice);
+        dispatchRowSrc(row[ra..rb], vis, if (clip_row != null) keep_stack[0 .. b - a] else null, paint.blend_mode, paint.dst_color_type);
+        off = chunk_end;
     }
 }
 
@@ -924,7 +947,7 @@ test "hoisted row dispatch == per-pixel reference (±1 LSB): every mode x covera
                 var p: SmPaint = .{ .shader = shader, .blend_mode = mode, .cxform = cxf, .global_alpha = ga, .dst_color_type = ct };
                 var a = dst_init;
                 var b = dst_init;
-                dispatchShader(&a, 3, 7, coverage, &p, clip_row);
+                dispatchShader(&a, 3, 7, coverage, &p, clip_row, 3, N);
                 dispatchShaderReference(&b, 3, 7, coverage, &p, clip_row);
                 try expectWithin1(&b, &a);
             }
@@ -965,7 +988,52 @@ test "hoisted row dispatch == per-pixel reference (±1 LSB): every mode x covera
     blitRowFromSourceReference(wide_ref, wide_src, &wp, wide_clip);
     try expectWithin1(wide_ref, wide_dst);
     @memcpy(wide_ref, wide_dst);
-    dispatchShader(wide_dst, -50, 2, wide_clip, &wp, null);
+    dispatchShader(wide_dst, -50, 2, wide_clip, &wp, null, -50, W);
     dispatchShaderReference(wide_ref, -50, 2, wide_clip, &wp, null);
     try expectWithin1(wide_ref, wide_dst);
+}
+
+test "a run trimmed by a clip box samples as if untrimmed: gradient and pattern bytes inside the box match the unclipped run" {
+    const SmGradient = @import("../effects/SmGradient.zig");
+    const SmPattern = @import("../effects/SmPattern.zig");
+    const ta = std.testing.allocator;
+    var g = SmGradient.linearWithAllocator(ta, 2.5, 0, 61.25, 9);
+    defer g.deinit();
+    try g.addColorStop(0.0, "rgba(255, 32, 8, 0.9)");
+    try g.addColorStop(0.5, "rgba(10, 200, 90, 0.6)");
+    try g.addColorStop(1.0, "#0040ff");
+    g.setSpread(.reflect);
+    g.setSampling(.lut256);
+    const tile = [8]u8{ 250, 60, 10, 255, 20, 90, 200, 128 };
+    var pat = try SmPattern.createWithAllocator(ta, &tile, 2, 1, .repeat);
+    defer pat.deinit();
+    pat.setFilter(.bilinear);
+    pat.setTransform(0.83, 0.31, -0.27, 0.91, 2.5, -3.25);
+
+    const W: u32 = 64;
+    var prng = std.Random.DefaultPrng.init(0x7f1e);
+    const r = prng.random();
+    var backdrop: [W]u32 = undefined;
+    for (&backdrop) |*px| px.* = r.int(u32) | 0xFF000000;
+    var cov: [W]u8 = undefined;
+    for (&cov, 0..) |*c, i| c.* = if (i % 7 == 0) 255 else r.int(u8);
+    // The mask holds anything outside the box; only the box counts.
+    var mask: [W]u8 = undefined;
+    for (&mask) |*m| m.* = r.int(u8);
+    @memset(mask[10..30], 255);
+
+    const shaders = [2]SmPaint.Shader{ .{ .gradient = &g }, .{ .pattern = &pat } };
+    for (shaders) |shader| {
+        const p: SmPaint = .{ .shader = shader, .blend_mode = .src_over, .global_alpha = 220 };
+        var full = backdrop;
+        blitRow(&full, W, 3, 0, 58, cov[3..61], &p, null);
+        var boxed = backdrop;
+        blitRow(&boxed, W, 3, 0, 58, cov[3..61], &p, .{ .mask = null, .x0 = 10, .y0 = 0, .x1 = 30, .y1 = 1 });
+        var masked = backdrop;
+        blitRow(&masked, W, 3, 0, 58, cov[3..61], &p, .{ .mask = &mask, .x0 = 10, .y0 = 0, .x1 = 30, .y1 = 1 });
+        try std.testing.expectEqualSlices(u32, full[10..30], boxed[10..30]);
+        try std.testing.expectEqualSlices(u32, full[10..30], masked[10..30]);
+        try std.testing.expectEqualSlices(u32, backdrop[0..10], boxed[0..10]);
+        try std.testing.expectEqualSlices(u32, backdrop[30..], boxed[30..]);
+    }
 }

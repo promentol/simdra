@@ -25,6 +25,7 @@ const SmPath = @import("SmPath.zig");
 const SmPaint = @import("SmPaint.zig");
 const SmMatrix = @import("SmMatrix.zig");
 const SmScan = @import("SmScan.zig");
+const SmSpans = @import("SmSpans.zig");
 const SmBlitter = @import("SmBlitter.zig");
 const SmFont = @import("SmFont.zig");
 const SmSurface = @import("SmSurface.zig");
@@ -205,10 +206,14 @@ filter_blur_scratch: ?[]u8 = null,
 /// Antialias path coverage. False renders one sample per pixel, which
 /// is what Flash's "low" quality does — see `SmPaint.antialias`.
 antialias: bool = true,
-aa_accum: ?[]f32 = null,
+aa_accum: ?[]f64 = null,
 /// AA path-fill u8 coverage row, fed to `SmBlitter.blitRow`. Sized to
 /// `surface.width`. Lazily allocated, freed in `deinit`.
 aa_coverage: ?[]u8 = null,
+/// A row of 255s for replaying solid spans (see `fillSpans`).
+solid_row: ?[]u8 = null,
+/// The span builds' sweep rows (see `fillToSpans`).
+sweep_scratch: SmScan.SweepScratch = .{},
 
 /// Construct a fresh SmCanvas bound to `surface`. Inherits the surface's
 /// allocator into the embedded SmPath; SmList allocations use it via
@@ -324,7 +329,7 @@ pub fn deinit(self: *SmCanvas) void {
 /// ensureAaScratch — lazy allocator for the AA path fill scratches.
 /// Returns null if the canvas has zero pixels or allocation fails — in
 /// either case `fill()` / `stroke()` no-op rather than crash.
-fn ensureAaScratch(self: *SmCanvas) ?struct { accum: []f32, cov: []u8 } {
+fn ensureAaScratch(self: *SmCanvas) ?struct { accum: []f64, cov: []u8 } {
     const w: usize = self.surface.width;
     if (w == 0) return null;
     const allocator = self.surface.getAllocator();
@@ -332,13 +337,15 @@ fn ensureAaScratch(self: *SmCanvas) ?struct { accum: []f32, cov: []u8 } {
     const accum_len = w + SmScan.accum_slack;
     if (self.aa_accum == null or self.aa_accum.?.len < accum_len) {
         if (self.aa_accum) |s| allocator.free(s);
-        self.aa_accum = allocator.alloc(f32, accum_len) catch {
+        self.aa_accum = allocator.alloc(f64, accum_len) catch {
             self.aa_accum = null;
             return null;
         };
     }
     if (self.aa_coverage == null or self.aa_coverage.?.len < w) {
         if (self.aa_coverage) |s| allocator.free(s);
+    if (self.solid_row) |s| allocator.free(s);
+    self.sweep_scratch.deinit(allocator);
         self.aa_coverage = allocator.alloc(u8, w) catch {
             self.aa_coverage = null;
             return null;
@@ -1740,6 +1747,91 @@ pub fn fillPathExternal(self: *SmCanvas, path: *const SmPath, fill_rule: SmScan.
 /// scanline pipeline as fill().
 pub fn stroke(self: *SmCanvas) void {
     self.strokeInternal(&self.path);
+}
+
+// --- Spans: build once, replay at whole-pixel offsets ------------------
+
+/// Whether `fillToSpans` / `strokeToSpans` can stand in for `fill` /
+/// `stroke`: the analytic antialiased converter is the one recorded.
+pub fn spansSupported(self: *const SmCanvas) bool {
+    return self.antialias;
+}
+
+/// fillToSpans(fill_rule, spans, y_clip) — the current path's fill as
+/// coverage runs (see SmSpans.zig) instead of pixels. Paint-independent:
+/// the same spans replay under any fill style, alpha, blend or clip.
+/// `y_clip` limits the rows swept (surface rows, for a shape far taller
+/// than the surface); the rows kept are byte-identical either way.
+pub fn fillToSpans(self: *SmCanvas, fill_rule: SmScan.FillRule, spans: *SmSpans, y_clip: ?[2]i32) !void {
+    if (!self.spansSupported()) return error.Unsupported;
+    try SmScan.fillPathToSpans(self.surface.getAllocator(), &self.path, fill_rule, spans, &self.sweep_scratch, y_clip);
+}
+
+/// strokeToSpans(spans) — the current path's stroke outline as runs,
+/// with the line width, caps, join, miter limit and dash in force.
+pub fn strokeToSpans(self: *SmCanvas, spans: *SmSpans, y_clip: ?[2]i32) !void {
+    if (!self.spansSupported()) return error.Unsupported;
+    try SmScan.strokePathToSpans(
+        self.surface.getAllocator(),
+        &self.path,
+        self.lineWidth,
+        self.lineCap,
+        self.lineJoin,
+        self.miterLimit,
+        self.line_dash_storage.ptr[0..self.line_dash_storage.len],
+        self.lineDashOffset,
+        spans,
+        &self.sweep_scratch,
+        y_clip,
+    );
+}
+
+/// fillSpans(spans, dx, dy) — blend recorded runs shifted by whole
+/// pixels with the current fill paint state, exactly as `fill` would
+/// have blended the same runs.
+pub fn fillSpans(self: *SmCanvas, spans: *const SmSpans, dx: i32, dy: i32) void {
+    const filter = self.beginFilterLayer();
+    defer self.endFilterLayer(filter);
+    const shadow = self.beginShadowLayer();
+    defer self.endShadowLayer(shadow);
+    const layer = self.beginCompositeLayer();
+    defer self.endCompositeLayer(layer);
+    var paint = self.paintForFill();
+    self.replaySpans(spans, dx, dy, &paint);
+}
+
+/// strokeSpans(spans, dx, dy) — `fillSpans` with the stroke paint.
+pub fn strokeSpans(self: *SmCanvas, spans: *const SmSpans, dx: i32, dy: i32) void {
+    const filter = self.beginFilterLayer();
+    defer self.endFilterLayer(filter);
+    const shadow = self.beginShadowLayer();
+    defer self.endShadowLayer(shadow);
+    const layer = self.beginCompositeLayer();
+    defer self.endCompositeLayer(layer);
+    var paint = paintFromShader(self.strokeStyle, .fill, 0, self.alpha, self.blendMode, self.cxform, self.surface.color_type);
+    paint.antialias = self.antialias;
+    self.replaySpans(spans, dx, dy, &paint);
+}
+
+fn replaySpans(self: *SmCanvas, spans: *const SmSpans, dx: i32, dy: i32, paint: *const SmPaint) void {
+    const solid = self.ensureSolidRow(spans.max_run) orelse return;
+    spans.replay(self.pixels, self.surface.width, self.surface.height, dx, dy, paint, self.clipRef(), solid);
+}
+
+fn ensureSolidRow(self: *SmCanvas, n: usize) ?[]const u8 {
+    const allocator = self.surface.getAllocator();
+    const want = @max(n, @as(usize, self.surface.width));
+    if (self.solid_row == null or self.solid_row.?.len < want) {
+        if (self.solid_row) |s| allocator.free(s);
+    self.sweep_scratch.deinit(allocator);
+        const row = allocator.alloc(u8, want) catch {
+            self.solid_row = null;
+            return null;
+        };
+        @memset(row, 255);
+        self.solid_row = row;
+    }
+    return self.solid_row.?[0..want];
 }
 
 /// strokePathExternal(path) — outline an arbitrary `SmPath` with the

@@ -17,6 +17,8 @@ const SmPath = @import("SmPath.zig");
 const SmPaint = @import("SmPaint.zig");
 const SmBlitter = @import("SmBlitter.zig");
 const SmList = @import("../utils/SmList.zig").SmList;
+const SmSpans = @import("SmSpans.zig");
+const SmMatrix = @import("SmMatrix.zig");
 
 /// HTML5 `fillRule` argument. Default `'nonzero'`. `'evenodd'` flips parity
 /// at every edge crossing regardless of direction.
@@ -434,7 +436,7 @@ pub fn fillPath(
     fill_rule: FillRule,
     clip: ?SmBlitter.Clip,
     paint: *const SmPaint,
-    aa_accum: []f32,
+    aa_accum: []f64,
     cov_row: []u8,
 ) !void {
     if (path.verbs.len == 0) return;
@@ -459,7 +461,7 @@ fn sweepFill(
     fill_rule: FillRule,
     clip: ?SmBlitter.Clip,
     paint: *const SmPaint,
-    aa_accum: []f32,
+    aa_accum: []f64,
     cov_row: []u8,
 ) !void {
     if (paint.antialias and paint.aa_mode == .analytic) {
@@ -494,7 +496,7 @@ pub fn fillPolygonF(
     vertices: []const [2]f64,
     clip: ?SmBlitter.Clip,
     paint: *const SmPaint,
-    aa_accum: []f32,
+    aa_accum: []f64,
     cov_row: []u8,
 ) !void {
     if (vertices.len < 3) return;
@@ -540,7 +542,7 @@ pub fn fillPolygonF(
 /// combination inside `SmBlitter.blitRow` together compose AA shapes
 /// correctly across AA clip boundaries.
 ///
-/// Allocates per-row AA scratches (`aa_accum: []f32`, `cov_row: []u8`)
+/// Allocates per-row AA scratches (`aa_accum: []f64`, `cov_row: []u8`)
 /// locally — clip is a save/restore-time op (rare), no need to thread
 /// scratches through from `SmCanvas`.
 pub fn fillPathToCoverage(
@@ -621,7 +623,7 @@ pub fn fillPathToCoverageBox(
     defer edges.deinit(allocator);
     try flattenPathToFillEdges(allocator, path, &edges);
 
-    const aa_accum = try allocator.alloc(f32, canvas_w + accum_slack);
+    const aa_accum = try allocator.alloc(f64, canvas_w + accum_slack);
     defer allocator.free(aa_accum);
     const cov_row = try allocator.alloc(u8, canvas_w);
     defer allocator.free(cov_row);
@@ -677,7 +679,7 @@ const aa_sub_weight: f32 = 1.0 / @as(f32, @floatFromInt(aa_sub_count));
 /// at all — approximating it by thresholding area coverage is not the
 /// same thing, because the area is itself quantized to the sub-sample
 /// grid.
-inline fn depositSpanPoint(accum: []f32, x_lo: f64, x_hi: f64, cw: i32) void {
+inline fn depositSpanPoint(accum: []f64, x_lo: f64, x_hi: f64, cw: i32) void {
     const first_f = @ceil(x_lo - 0.5);
     const last_f = @ceil(x_hi - 0.5) - 1.0;
     var i: i32 = @max(0, @as(i32, @intFromFloat(first_f)));
@@ -685,7 +687,7 @@ inline fn depositSpanPoint(accum: []f32, x_lo: f64, x_hi: f64, cw: i32) void {
     while (i <= last) : (i += 1) accum[@intCast(i)] = 1.0;
 }
 
-inline fn depositSpan(accum: []f32, x_lo: f64, x_hi: f64, weight: f32, cw: i32) void {
+inline fn depositSpan(accum: []f64, x_lo: f64, x_hi: f64, weight: f32, cw: i32) void {
     const cw_f: f64 = @floatFromInt(cw);
     const x_lo_c: f64 = @max(0.0, x_lo);
     const x_hi_c: f64 = @min(cw_f, x_hi);
@@ -694,17 +696,17 @@ inline fn depositSpan(accum: []f32, x_lo: f64, x_hi: f64, weight: f32, cw: i32) 
     const i_first: i32 = @as(i32, @intFromFloat(@floor(x_lo_c)));
     const i_last: i32 = @as(i32, @intFromFloat(@ceil(x_hi_c))) - 1;
     if (i_first == i_last) {
-        accum[@intCast(i_first)] += weight * @as(f32, @floatCast(x_hi_c - x_lo_c));
+        accum[@intCast(i_first)] += @as(f64, @floatCast(weight * @as(f32, @floatCast(x_hi_c - x_lo_c))));
         return;
     }
     const left_partial: f64 = @as(f64, @floatFromInt(i_first + 1)) - x_lo_c;
-    accum[@intCast(i_first)] += weight * @as(f32, @floatCast(left_partial));
+    accum[@intCast(i_first)] += @as(f64, @floatCast(weight * @as(f32, @floatCast(left_partial))));
     var k: i32 = i_first + 1;
     while (k < i_last) : (k += 1) {
-        accum[@intCast(k)] += weight;
+        accum[@intCast(k)] += @as(f64, @floatCast(weight));
     }
     const right_partial: f64 = x_hi_c - @as(f64, @floatFromInt(i_last));
-    accum[@intCast(i_last)] += weight * @as(f32, @floatCast(right_partial));
+    accum[@intCast(i_last)] += @as(f64, @floatCast(weight * @as(f32, @floatCast(right_partial))));
 }
 
 /// sweepEdges — scanline sweep with anti-aliased per-pixel coverage.
@@ -737,7 +739,7 @@ fn sweepEdges(
     fill_rule: FillRule,
     clip: ?SmBlitter.Clip,
     paint: *const SmPaint,
-    aa_accum: []f32,
+    aa_accum: []f64,
     cov_row: []u8,
 ) !void {
     if (edges.len == 0) return;
@@ -913,7 +915,13 @@ fn sweepEdges(
 /// Deposit one row segment into the accumulator. `xa`, `xb` are the
 /// segment's x at the row's entry and exit (either order, clamped to
 /// [0, W]); `d` is direction × the segment's height within the row.
-inline fn depositSegment(acc: []f32, xa: f32, xb: f32, d: f32) void {
+inline fn depositSegment(acc: []f64, xa: f64, xb: f64, d: f64) void {
+    // All in f64: every quantity here is a difference or a fraction of
+    // positions, which shifting the geometry by whole pixels leaves
+    // bit-identical — so a shape swept in its own space deposits the
+    // same numbers as the same shape swept in place (see sweepToSpans).
+    // The old f32 arithmetic cast the absolute positions first, and a
+    // position near 100 sits on a coarser f32 grid than one near 10.
     const x0 = @min(xa, xb);
     const x1 = @max(xa, xb);
     const x0floor = @floor(x0);
@@ -940,7 +948,7 @@ inline fn depositSegment(acc: []f32, xa: f32, xb: f32, d: f32) void {
         acc[x0i + 1] += d * (a1 - a0);
         var xi = x0i + 2;
         while (xi < x1i - 1) : (xi += 1) acc[xi] += d * s;
-        const a2 = a1 + @as(f32, @floatFromInt(x1i - x0i - 3)) * s;
+        const a2 = a1 + @as(f64, @floatFromInt(x1i - x0i - 3)) * s;
         acc[x1i - 1] += d * (1.0 - a2 - am);
     }
     acc[x1i] += d * am;
@@ -997,7 +1005,7 @@ fn sweepAnalytic(
     canvas_w: u32,
     canvas_h: u32,
     fill_rule: FillRule,
-    aa_accum: []f32,
+    aa_accum: []f64,
     cov_row: []u8,
     emit: anytype,
     y_clip: ?[2]i32,
@@ -1073,8 +1081,8 @@ fn sweepAnalytic(
             if (yb <= ya) continue;
             const xa64 = @min(w_f, @max(0.0, a.x_at_y_min + (ya - a.y_min) * a.inv_slope));
             const xb64 = @min(w_f, @max(0.0, a.x_at_y_min + (yb - a.y_min) * a.inv_slope));
-            const d: f32 = @floatCast(@as(f64, @floatFromInt(a.dir)) * (yb - ya));
-            depositSegment(acc, @floatCast(xa64), @floatCast(xb64), d);
+            const d: f64 = @as(f64, @floatFromInt(a.dir)) * (yb - ya);
+            depositSegment(acc, xa64, xb64, d);
             const lo_i: i32 = @intFromFloat(@floor(@min(xa64, xb64)));
             const hi_i: i32 = @as(i32, @intFromFloat(@ceil(@max(xa64, xb64)))) + 2;
             if (lo_i < row_x_min) row_x_min = lo_i;
@@ -1087,16 +1095,22 @@ fn sweepAnalytic(
         // is zero left of row_x_min (nothing deposited there) and the
         // visible cells end at W.
         const x_end: i32 = @min(row_x_max, cw_i);
-        var sum: f32 = 0.0;
+        // The sum runs in f64 so that the order the segments were
+        // deposited in, and the cell the walk starts from, cannot move
+        // a coverage byte: the same shape swept at another offset (see
+        // sweepToSpans) quantizes to the same bytes. The quantization
+        // itself stays in f32, as it always was.
+        var sum: f64 = 0.0;
         var x: i32 = row_x_min;
         var run_start: i32 = -1;
         while (x < x_end) : (x += 1) {
             sum += acc[@intCast(x)];
+            const sum32: f32 = @floatCast(sum);
             var cov: f32 = undefined;
             if (fill_rule == .nonzero) {
-                cov = @min(1.0, @abs(sum));
+                cov = @min(1.0, @abs(sum32));
             } else {
-                var t = @abs(sum);
+                var t = @abs(sum32);
                 t -= 2.0 * @floor(t * 0.5);
                 cov = if (t > 1.0) 2.0 - t else t;
             }
@@ -1132,7 +1146,7 @@ fn sweepEdgesToCoverageMask(
     canvas_w: u32,
     canvas_h: u32,
     fill_rule: FillRule,
-    aa_accum: []f32,
+    aa_accum: []f64,
     cov_row: []u8,
     antialias: bool,
     box: *RowBox,
@@ -1947,7 +1961,7 @@ pub fn strokePath(
     line_dash_offset: f64,
     clip: ?SmBlitter.Clip,
     paint: *const SmPaint,
-    aa_accum: []f32,
+    aa_accum: []f64,
     cov_row: []u8,
 ) !void {
     if (path.verbs.len == 0 or line_width <= 0) return;
@@ -1973,8 +1987,302 @@ pub fn strokePath(
 }
 
 // ---------------------------------------------------------------------------
+// Spans: the sweep's runs kept for replay (see SmSpans.zig)
+// ---------------------------------------------------------------------------
+
+/// Largest shape-space box a span build accepts; beyond it the caller
+/// draws directly (the sweep would otherwise cover the whole shape, not
+/// just the part on the canvas).
+pub const spans_max_side: u32 = 4096;
+
+/// The per-row scratch a span build sweeps with, grown to the widest
+/// shape seen and kept by the caller across builds.
+pub const SweepScratch = struct {
+    accum: []f64 = &.{},
+    cov: []u8 = &.{},
+
+    pub fn deinit(self: *SweepScratch, allocator: std.mem.Allocator) void {
+        if (self.accum.len > 0) allocator.free(self.accum);
+        if (self.cov.len > 0) allocator.free(self.cov);
+        self.* = .{};
+    }
+
+    fn ensure(self: *SweepScratch, allocator: std.mem.Allocator, w: usize) !void {
+        if (self.accum.len < w + accum_slack) {
+            if (self.accum.len > 0) allocator.free(self.accum);
+            self.accum = &.{};
+            self.accum = try allocator.alloc(f64, w + accum_slack);
+        }
+        if (self.cov.len < w) {
+            if (self.cov.len > 0) allocator.free(self.cov);
+            self.cov = &.{};
+            self.cov = try allocator.alloc(u8, w);
+        }
+    }
+};
+
+/// fillPathToSpans — the analytic sweep of `path` (already in device
+/// space) recorded into `spans` instead of blended. The sweep runs over
+/// the path's own box, so nothing is clipped to a canvas width: the runs
+/// are complete and `SmSpans.replay` trims them to the surface they
+/// land on. `y_clip`, in the path's own space, limits the ROWS swept
+/// (rows are independent, so the bytes of the rows kept are those of
+/// the full sweep) — for a shape far taller than the surface.
+pub fn fillPathToSpans(
+    allocator: std.mem.Allocator,
+    path: *const SmPath,
+    fill_rule: FillRule,
+    spans: *SmSpans,
+    scratch: *SweepScratch,
+    y_clip: ?[2]i32,
+) !void {
+    if (path.verbs.len == 0) return;
+    var edges: EdgeBuf = .{};
+    defer edges.deinit(allocator);
+    try flattenPathToFillEdges(allocator, path, &edges);
+    try sweepToSpans(&edges, allocator, fill_rule, spans, scratch, y_clip);
+}
+
+/// strokePathToSpans — `strokePath`'s outline recorded like
+/// `fillPathToSpans`.
+pub fn strokePathToSpans(
+    allocator: std.mem.Allocator,
+    path: *const SmPath,
+    line_width: f64,
+    line_cap: SmPaint.LineCap,
+    line_join: SmPaint.LineJoin,
+    miter_limit: f64,
+    line_dash: []const f64,
+    line_dash_offset: f64,
+    spans: *SmSpans,
+    scratch: *SweepScratch,
+    y_clip: ?[2]i32,
+) !void {
+    if (path.verbs.len == 0 or line_width <= 0) return;
+    var edges: EdgeBuf = .{};
+    defer edges.deinit(allocator);
+    try flattenPathToStrokeEdges(allocator, path, &edges, line_width, line_cap, line_join, miter_limit, line_dash, line_dash_offset);
+    try sweepToSpans(&edges, allocator, .nonzero, spans, scratch, y_clip);
+}
+
+/// Shift the edges so their box starts at (1, 0), sweep that box, and
+/// record every run shifted back. The shift is by whole pixels, so the
+/// cells a segment deposits into are the same cells, moved.
+fn sweepToSpans(edges: *EdgeBuf, allocator: std.mem.Allocator, fill_rule: FillRule, spans: *SmSpans, scratch: *SweepScratch, y_clip: ?[2]i32) !void {
+    if (edges.len == 0) return;
+    var min_x: f64 = std.math.inf(f64);
+    var max_x: f64 = -std.math.inf(f64);
+    var min_y: f64 = std.math.inf(f64);
+    var max_y: f64 = -std.math.inf(f64);
+    for (edges.ptr[0..edges.len]) |e| {
+        const x_end = e.x_at_y_min + (e.y_max - e.y_min) * e.inv_slope;
+        min_x = @min(min_x, @min(e.x_at_y_min, x_end));
+        max_x = @max(max_x, @max(e.x_at_y_min, x_end));
+        min_y = @min(min_y, e.y_min);
+        max_y = @max(max_y, e.y_max);
+    }
+    if (!std.math.isFinite(min_x) or !std.math.isFinite(max_x) or !std.math.isFinite(min_y) or !std.math.isFinite(max_y)) return error.Unsupported;
+    const lim: f64 = @floatFromInt(spans_max_side);
+    if (max_x - min_x > lim) return error.TooLarge;
+    if (y_clip) |yc| {
+        min_y = @max(min_y, @as(f64, @floatFromInt(yc[0])));
+        max_y = @min(max_y, @as(f64, @floatFromInt(yc[1])));
+        if (min_y >= max_y) return;
+    }
+    if (max_y - min_y > lim) return error.TooLarge;
+    // One spare column on the left keeps every edge strictly inside the
+    // box (the width clip clamps edges AT the boundary to verticals).
+    const x0: i32 = @as(i32, @intFromFloat(@floor(min_x))) - 1;
+    const y0: i32 = @intFromFloat(@floor(min_y));
+    const w: u32 = @intCast(@as(i32, @intFromFloat(@ceil(max_x))) - x0 + 2);
+    const h: u32 = @intCast(@as(i32, @intFromFloat(@ceil(max_y))) - y0 + 1);
+    const fx: f64 = @floatFromInt(x0);
+    const fy: f64 = @floatFromInt(y0);
+    for (edges.ptr[0..edges.len]) |*e| {
+        e.x_at_y_min -= fx;
+        e.y_min -= fy;
+        e.y_max -= fy;
+    }
+    try scratch.ensure(allocator, w);
+    const emit = struct {
+        spans: *SmSpans,
+        allocator: std.mem.Allocator,
+        x0: i32,
+        y0: i32,
+        fn run(self: @This(), canvas_w_: u32, x: i32, y: i32, c: []const u8) void {
+            _ = canvas_w_;
+            self.spans.addRun(self.allocator, x + self.x0, y + self.y0, c);
+        }
+    }{ .spans = spans, .allocator = allocator, .x0 = x0, .y0 = y0 };
+    try sweepAnalytic(edges, allocator, w, h, fill_rule, scratch.accum, scratch.cov, emit, null);
+    if (spans.oom) return error.OutOfMemory;
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+test "spans replay the direct fill byte for byte: 32 seeded paths, whole-pixel offsets" {
+    // Every seeded path is filled directly on a canvas large enough to
+    // hold it whole (the direct sweep clips edges at the canvas border,
+    // and the split moves an f32 area share by an ulp — see the next
+    // test), and built as spans and replayed at the integer offset; a
+    // second replay two pixels down and three right must equal the
+    // direct fill of the path moved the same way.
+    const a = std.testing.allocator;
+    // Seeded coordinates run from -8 to 104, and a seeded rect can reach
+    // 64 further: 20 px of margin on the left, 100 on the right.
+    const W: u32 = 224;
+    const H: u32 = 200;
+    const direct = try a.alloc(u32, W * H);
+    defer a.free(direct);
+    const via = try a.alloc(u32, W * H);
+    defer a.free(via);
+    const accum = try a.alloc(f64, W + accum_slack);
+    defer a.free(accum);
+    const cov = try a.alloc(u8, W);
+    defer a.free(cov);
+    const solid = try a.alloc(u8, 8192);
+    defer a.free(solid);
+    @memset(solid, 255);
+    var scratch: SweepScratch = .{};
+    defer scratch.deinit(a);
+    var prng = std.Random.DefaultPrng.init(0x5eed);
+    const r = prng.random();
+    var mismatched: usize = 0;
+    var i: usize = 0;
+    while (i < 32) : (i += 1) {
+        var seeded = try testPath(a, r, i);
+        defer seeded.deinit();
+        // Seeded coordinates run from -8 to 104: move them inside.
+        var path = SmPath.emptyWithAllocator(a);
+        defer path.deinit();
+        try path.addPathTransform(&seeded, &SmMatrix.components(1, 0, 0, 1, 20, 24));
+        const rule: FillRule = if (i % 2 == 0) .nonzero else .evenodd;
+        const paint: SmPaint = .{ .shader = .{ .solid = if (i % 3 == 0) 0xFF3050C0 else 0x80C05030 }, .style = .fill, .blend_mode = .src_over, .antialias = true };
+        @memset(direct, 0xFFFFFFFF);
+        try fillPath(a, direct, W, H, &path, rule, null, &paint, accum, cov);
+        var spans: SmSpans = .{};
+        defer spans.deinit(a);
+        try fillPathToSpans(a, &path, rule, &spans, &scratch, null);
+        @memset(via, 0xFFFFFFFF);
+        spans.replay(via, W, H, 0, 0, &paint, null, solid);
+        if (!std.mem.eql(u32, direct, via)) {
+            mismatched += 1;
+            var n: usize = 0;
+            for (direct, via) |d, v| n += @intFromBool(d != v);
+            std.debug.print("spans mismatch: path {d} at offset 0, {d} px\n", .{ i, n });
+        }
+        var moved = SmPath.emptyWithAllocator(a);
+        defer moved.deinit();
+        try moved.addPathTransform(&path, &SmMatrix.components(1, 0, 0, 1, 3, 2));
+        @memset(direct, 0xFFFFFFFF);
+        try fillPath(a, direct, W, H, &moved, rule, null, &paint, accum, cov);
+        @memset(via, 0xFFFFFFFF);
+        spans.replay(via, W, H, 3, 2, &paint, null, solid);
+        if (!std.mem.eql(u32, direct, via)) {
+            mismatched += 1;
+            var n: usize = 0;
+            for (direct, via) |d, v| n += @intFromBool(d != v);
+            std.debug.print("spans mismatch: path {d} moved, {d} px\n", .{ i, n });
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 0), mismatched);
+}
+
+test "spans of a path crossing the canvas border stay within one LSB of the direct fill" {
+    const a = std.testing.allocator;
+    const W: u32 = 128;
+    const H: u32 = 128;
+    const direct = try a.alloc(u32, W * H);
+    defer a.free(direct);
+    const via = try a.alloc(u32, W * H);
+    defer a.free(via);
+    const accum = try a.alloc(f64, W + accum_slack);
+    defer a.free(accum);
+    const cov = try a.alloc(u8, W);
+    defer a.free(cov);
+    const solid = try a.alloc(u8, 8192);
+    defer a.free(solid);
+    @memset(solid, 255);
+    var scratch: SweepScratch = .{};
+    defer scratch.deinit(a);
+    var prng = std.Random.DefaultPrng.init(0x5eed);
+    const r = prng.random();
+    var worst: u32 = 0;
+    var differing: usize = 0;
+    var i: usize = 0;
+    while (i < 32) : (i += 1) {
+        var path = try testPath(a, r, i);
+        defer path.deinit();
+        const rule: FillRule = if (i % 2 == 0) .nonzero else .evenodd;
+        const paint: SmPaint = .{ .shader = .{ .solid = 0xFF3050C0 }, .style = .fill, .blend_mode = .src_over, .antialias = true };
+        @memset(direct, 0xFFFFFFFF);
+        try fillPath(a, direct, W, H, &path, rule, null, &paint, accum, cov);
+        var spans: SmSpans = .{};
+        defer spans.deinit(a);
+        // Rows clipped to the canvas, as a renderer would for a tall shape.
+        try fillPathToSpans(a, &path, rule, &spans, &scratch, .{ 0, @intCast(H) });
+        @memset(via, 0xFFFFFFFF);
+        spans.replay(via, W, H, 0, 0, &paint, null, solid);
+        for (direct, via) |d, v| {
+            if (d == v) continue;
+            differing += 1;
+            inline for (0..4) |ch| {
+                const dc: u32 = (d >> (8 * ch)) & 0xFF;
+                const vc: u32 = (v >> (8 * ch)) & 0xFF;
+                worst = @max(worst, if (dc > vc) dc - vc else vc - dc);
+            }
+        }
+    }
+    try std.testing.expect(worst <= 1);
+    // A handful of border cells at most, over 32 × 16k pixels.
+    try std.testing.expect(differing < 64);
+}
+
+test "stroke spans replay the direct stroke, under a box clip and a mask" {
+    const a = std.testing.allocator;
+    const W: u32 = 96;
+    const H: u32 = 80;
+    const direct = try a.alloc(u32, W * H);
+    defer a.free(direct);
+    const via = try a.alloc(u32, W * H);
+    defer a.free(via);
+    const accum = try a.alloc(f64, W + accum_slack);
+    defer a.free(accum);
+    const cov = try a.alloc(u8, W);
+    defer a.free(cov);
+    const solid = try a.alloc(u8, 4096);
+    defer a.free(solid);
+    @memset(solid, 255);
+    const mask = try a.alloc(u8, W * H);
+    defer a.free(mask);
+    for (mask, 0..) |*m, k| m.* = @intCast((k * 7) % 256);
+    var path = SmPath.emptyWithAllocator(a);
+    defer path.deinit();
+    path.moveTo(12.3, 12.7);
+    path.quadraticCurveTo(40.1, 8.2, 70.6, 30.4);
+    path.lineTo(84.2, 60.9);
+    path.bezierCurveTo(50.5, 70.1, 20.2, 66.3, 9.5, 40.4);
+    const paint: SmPaint = .{ .shader = .{ .solid = 0xC0203040 }, .style = .fill, .blend_mode = .src_over, .antialias = true };
+    const clips = [_]?SmBlitter.Clip{
+        null,
+        .{ .mask = null, .x0 = 8, .y0 = 5, .x1 = 70, .y1 = 60 },
+        .{ .mask = mask, .x0 = 3, .y0 = 2, .x1 = 90, .y1 = 75 },
+    };
+    for (clips) |clip| {
+        @memset(direct, 0xFF102030);
+        try strokePath(a, direct, W, H, &path, 6.5, .round, .miter, 10.0, &.{}, 0, clip, &paint, accum, cov);
+        var spans: SmSpans = .{};
+        defer spans.deinit(a);
+        var scratch: SweepScratch = .{};
+        defer scratch.deinit(a);
+        try strokePathToSpans(a, &path, 6.5, .round, .miter, 10.0, &.{}, 0, &spans, &scratch, null);
+        @memset(via, 0xFF102030);
+        spans.replay(via, W, H, 0, 0, &paint, clip, solid);
+        try std.testing.expect(std.mem.eql(u32, direct, via));
+    }
+}
 
 /// The 32 seeded paths every scan-converter test draws: lines, quads,
 /// cubics and rects with coordinates that run past the canvas on every
@@ -2060,7 +2368,7 @@ test "coverage goldens and the analytic tolerance: 32 seeded paths through fillP
     defer a.free(mask);
     const mask_ref = try a.alloc(u8, W * H);
     defer a.free(mask_ref);
-    const accum = try a.alloc(f32, W + accum_slack);
+    const accum = try a.alloc(f64, W + accum_slack);
     defer a.free(accum);
     const cov = try a.alloc(u8, W);
     defer a.free(cov);
@@ -2139,7 +2447,7 @@ test "stroke: repeated points change nothing, and a hairline with a zero-length 
     defer a.free(pixels);
     const ref = try a.alloc(u32, W * H);
     defer a.free(ref);
-    const accum = try a.alloc(f32, W + accum_slack);
+    const accum = try a.alloc(f64, W + accum_slack);
     defer a.free(accum);
     const cov = try a.alloc(u8, W);
     defer a.free(cov);
@@ -2195,7 +2503,7 @@ test "stroke inner join: a closed hairline folding back on itself stays inside i
     const H: u32 = 208;
     const pixels = try a.alloc(u32, W * H);
     defer a.free(pixels);
-    const accum = try a.alloc(f32, W + accum_slack);
+    const accum = try a.alloc(f64, W + accum_slack);
     defer a.free(accum);
     const cov = try a.alloc(u8, W);
     defer a.free(cov);

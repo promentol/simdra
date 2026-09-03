@@ -6,6 +6,7 @@
 test {
     _ = @import("core/SmBlitter.zig");
     _ = @import("core/SmScan.zig");
+    _ = @import("core/SmSpans.zig");
     _ = @import("effects/SmGradient.zig");
     _ = @import("effects/SmPattern.zig");
     _ = @import("opts/generic.zig");

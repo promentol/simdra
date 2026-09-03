@@ -191,25 +191,35 @@ const Axis4 = struct {
     /// pixel alone. Null when the fixed point cannot hold it (the
     /// caller samples per pixel in f64, deterministically too).
     fn initAt(u_zero: f64, du: f64, x0: i64, n: u32, tiled: bool) ?Axis4 {
-        const nf: f64 = @floatFromInt(n);
-        var u = u_zero;
-        var d = du;
-        if (tiled) {
-            u = @mod(u_zero, nf);
-            if (u < 0 or u >= nf) u = 0;
-            d = @mod(du, nf);
-            if (d < 0 or d >= nf) d = 0;
-        } else if (@abs(u_zero) > 1.0e9 or @abs(du) > 1.0e9) {
-            return null;
-        }
         const n_fx: i64 = @as(i64, n) * one;
-        var base: i128 = @as(i128, fx(u)) + @as(i128, x0) * @as(i128, fx(d));
+        var base: i128 = undefined;
+        var d_fx: i64 = undefined;
         if (tiled) {
-            base = @mod(base, @as(i128, n_fx));
-        } else if (base > (1 << 62) or base < -(1 << 62)) {
-            return null;
+            // Fold in the fixed point: floor(v · 2^32) mod (n · 2^32) is
+            // floor((v − k·n) · 2^32) for the k that lands in [0, n), the
+            // same number the float remainder gave, without an fmod per
+            // run (it was 2 % of a frame). Values the fixed point cannot
+            // hold take the float remainder first.
+            base = @mod(@as(i128, fxTiled(u_zero, n)), @as(i128, n_fx));
+            d_fx = @intCast(@mod(@as(i128, fxTiled(du, n)), @as(i128, n_fx)));
+            base = @mod(base + @as(i128, x0) * @as(i128, d_fx), @as(i128, n_fx));
+        } else {
+            if (@abs(u_zero) > 1.0e9 or @abs(du) > 1.0e9) return null;
+            d_fx = fx(du);
+            base = @as(i128, fx(u_zero)) + @as(i128, x0) * @as(i128, d_fx);
+            if (base > (1 << 62) or base < -(1 << 62)) return null;
         }
-        return .{ .base = @intCast(base), .du = fx(d), .n = n_fx, .tiled = tiled };
+        return .{ .base = @intCast(base), .du = d_fx, .n = n_fx, .tiled = tiled };
+    }
+
+    /// `fx` of a tiled-axis value: direct while the product fits the
+    /// fixed point, else of its float remainder (the old path).
+    inline fn fxTiled(v: f64, n: u32) i64 {
+        if (@abs(v) < 1.0e9) return fx(v);
+        const nf: f64 = @floatFromInt(n);
+        var r = @mod(v, nf);
+        if (r < 0 or r >= nf) r = 0;
+        return fx(r);
     }
 
     /// Null when the coordinates are too large for the fixed point (a

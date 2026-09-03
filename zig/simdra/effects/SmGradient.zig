@@ -76,6 +76,11 @@ spread: Spread = .pad,
 straight_alpha: bool = false,
 /// Stop-lookup strategy; see `Sampling`. Defaulted to the exact scan.
 sampling: Sampling = .exact,
+/// Set when a stop was added under `.lut256`: the ramp is stale and the
+/// samplers scan the stops exactly until `prepare` (or `setSampling`)
+/// rebuilds it. Rebuilding on every stop made a 256-stop ramp cost
+/// 65k lerps; now it costs one build.
+lut_dirty: bool = false,
 /// Baked 256-entry ramp when `sampling == .lut256`, else null. Owned by
 /// `allocator`; freed in `deinit` / when switching back to `.exact`.
 lut: ?[]u32 = null,
@@ -177,6 +182,7 @@ fn rebuildLut(self: *SmGradient) void {
     for (l, 0..) |*e, i| {
         e.* = self.colorAtFolded(@as(f64, @floatFromInt(i)) / 255.0);
     }
+    self.lut_dirty = false;
 }
 
 // addColorStop(offset, color) — MDN: insert a color stop at `offset` ∈ [0,1].
@@ -196,7 +202,14 @@ pub fn addColorStop(
     }
     const rgba = css_color.parse(color) orelse return error.Syntax;
     try insertStopSorted(&self.stops, self.allocator, .{ .offset = offset, .rgba = rgba });
-    if (self.sampling == .lut256) self.rebuildLut();
+    if (self.sampling == .lut256) self.lut_dirty = true;
+}
+
+/// Build the ramp if `.lut256` is selected and it is missing or stale.
+/// Call once after the last stop; sampling a stale ramp falls back to
+/// the exact scan, so forgetting it costs speed, not correctness.
+pub fn prepare(self: *SmGradient) void {
+    if (self.sampling == .lut256 and (self.lut == null or self.lut_dirty)) self.rebuildLut();
 }
 
 // --- Per-pixel sampling --------------------------------------------------
@@ -283,9 +296,133 @@ fn colorAt(self: *const SmGradient, t: f64) u32 {
         },
     };
     if (self.lut) |l| {
-        return l[@intFromFloat(@round(tc * 255.0))];
+        if (!self.lut_dirty) return l[@intFromFloat(@round(tc * 255.0))];
     }
     return self.colorAtFolded(tc);
+}
+
+// --- Row sampling ----------------------------------------------------------
+//
+// The blitter fills a row at a time; along a row the linear parameter is
+// affine in x and the radial one solves the same quadratic with only dx
+// changing, so both are computed four pixels at a time in f32 and looked
+// up in the ramp (or, without a ramp, through the exact stop scan). The
+// per-pixel samplers above stay as the reference the row samplers are
+// tested against.
+
+const V4 = @Vector(4, f32);
+
+inline fn splat4(x: f32) V4 {
+    return @splat(x);
+}
+
+/// Fold four parameters by the spread mode; NaN folds to 0.
+inline fn fold4(self: *const SmGradient, t_in: V4) V4 {
+    const t = @select(f32, t_in != t_in, splat4(0), t_in);
+    return switch (self.spread) {
+        .pad => @min(@max(t, splat4(0)), splat4(1)),
+        .repeat => t - @floor(t),
+        .reflect => blk: {
+            const m = t - splat4(2) * @floor(t * splat4(0.5));
+            break :blk @select(f32, m > splat4(1), splat4(2) - m, m);
+        },
+    };
+}
+
+/// Four folded parameters to colours.
+inline fn lookup4(self: *const SmGradient, tc: V4, out: []u32) void {
+    if (self.lut) |l| {
+        if (!self.lut_dirty) {
+            const idx: @Vector(4, u32) = @intFromFloat(@round(tc * splat4(255)));
+            const ia: [4]u32 = idx;
+            inline for (0..4) |k| out[k] = l[ia[k]];
+            return;
+        }
+    }
+    const ta: [4]f32 = tc;
+    inline for (0..4) |k| out[k] = self.colorAtFolded(ta[k]);
+}
+
+/// Colours along a row whose parameter is `t0 + i * dt`.
+fn rowFromAffine(self: *const SmGradient, t0: f64, dt: f64, out: []u32) void {
+    const lane: V4 = .{ 0, 1, 2, 3 };
+    const dt4 = splat4(@floatCast(dt));
+    var i: usize = 0;
+    while (i + 4 <= out.len) : (i += 4) {
+        const base: f32 = @floatCast(t0 + @as(f64, @floatFromInt(i)) * dt);
+        self.lookup4(self.fold4(splat4(base) + lane * dt4), out[i..][0..4]);
+    }
+    while (i < out.len) : (i += 1) out[i] = self.colorAt(t0 + @as(f64, @floatFromInt(i)) * dt);
+}
+
+/// sampleLinearRow — `out[i]` = the colour at (x_start + i, y).
+pub fn sampleLinearRow(self: *const SmGradient, x_start: f64, y: f64, out: []u32) void {
+    const lin = self.geometry.linear;
+    const dx = lin.x1 - lin.x0;
+    const dy = lin.y1 - lin.y0;
+    const len_sq = dx * dx + dy * dy;
+    if (len_sq < 1e-12 or self.stops.len <= 1) {
+        @memset(out, self.colorAt(0));
+        return;
+    }
+    const t0 = ((x_start - lin.x0) * dx + (y - lin.y0) * dy) / len_sq;
+    self.rowFromAffine(t0, dx / len_sq, out);
+}
+
+/// sampleRadialRow — `out[i]` = the colour at (x_start + i, y), the
+/// two-circle quadratic solved four pixels at a time with `sampleRadial`'s
+/// root rule. The degenerate (linear) case takes the per-pixel sampler.
+pub fn sampleRadialRow(self: *const SmGradient, x_start: f64, y: f64, out: []u32) void {
+    const rad = self.geometry.radial;
+    const cdx = rad.x1 - rad.x0;
+    const cdy = rad.y1 - rad.y0;
+    const cdr = rad.r1 - rad.r0;
+    const A = cdx * cdx + cdy * cdy - cdr * cdr;
+    if (@abs(A) < 1e-12 or self.stops.len <= 1) {
+        for (out, 0..) |*o, i| o.* = self.sampleRadial(x_start + @as(f64, @floatFromInt(i)), y);
+        return;
+    }
+    const dy = y - rad.y0;
+    const b_const: f32 = @floatCast(dy * cdy + rad.r0 * cdr);
+    const c_const: f32 = @floatCast(dy * dy - rad.r0 * rad.r0);
+    const cdx4 = splat4(@floatCast(cdx));
+    const cdr4 = splat4(@floatCast(cdr));
+    const r04 = splat4(@floatCast(rad.r0));
+    const four_a = splat4(@floatCast(4.0 * A));
+    const inv_2a = splat4(@floatCast(1.0 / (2.0 * A)));
+    const lane: V4 = .{ 0, 1, 2, 3 };
+    var i: usize = 0;
+    while (i + 4 <= out.len) : (i += 4) {
+        const dx = splat4(@floatCast(x_start - rad.x0 + @as(f64, @floatFromInt(i)))) + lane;
+        const B = splat4(-2.0) * (dx * cdx4 + splat4(b_const));
+        const C = dx * dx + splat4(c_const);
+        const disc = B * B - four_a * C;
+        const valid = disc >= splat4(0);
+        const sq = @sqrt(@max(disc, splat4(0)));
+        const t_plus = (-B + sq) * inv_2a;
+        const t_minus = (-B - sq) * inv_2a;
+        const ok_plus = r04 + t_plus * cdr4 >= splat4(0);
+        const ok_minus = r04 + t_minus * cdr4 >= splat4(0);
+        const t = @select(f32, ok_plus, t_plus, t_minus);
+        const ok: @Vector(4, bool) = @select(bool, valid, @select(bool, ok_plus, ok_plus, ok_minus), @as(@Vector(4, bool), @splat(false)));
+        self.lookup4(self.fold4(t), out[i..][0..4]);
+        const oka: [4]bool = ok;
+        inline for (0..4) |k| {
+            if (!oka[k]) out[i + k] = 0;
+        }
+    }
+    while (i < out.len) : (i += 1) out[i] = self.sampleRadial(x_start + @as(f64, @floatFromInt(i)), y);
+}
+
+/// sampleRow — dispatch on the geometry; conic stays per pixel.
+pub fn sampleRow(self: *const SmGradient, x_start: f64, y: f64, out: []u32) void {
+    switch (self.geometry) {
+        .linear => self.sampleLinearRow(x_start, y, out),
+        .radial => self.sampleRadialRow(x_start, y, out),
+        .conic => for (out, 0..) |*o, i| {
+            o.* = self.sampleConic(x_start + @as(f64, @floatFromInt(i)), y);
+        },
+    }
 }
 
 /// Exact stop scan over an already-folded tc ∈ [0, 1].
@@ -458,4 +595,75 @@ test "lut256 sampling matches exact at ramp sample points, folds spread" {
     // Switching back to exact frees the ramp.
     g.setSampling(.exact);
     try std.testing.expect(g.lut == null);
+}
+
+test "row samplers match the per-pixel samplers: linear and radial, every spread, ramp and exact" {
+    const ta = std.testing.allocator;
+    const N = 203;
+    var row: [N]u32 = undefined;
+    var ref: [N]u32 = undefined;
+    inline for (.{ Sampling.exact, Sampling.lut256 }) |sampling| {
+        inline for (.{ Spread.pad, Spread.repeat, Spread.reflect }) |spread| {
+            var g = linearWithAllocator(ta, 10.5, 3, 70.25, 40);
+            defer g.deinit();
+            try g.addColorStop(0.0, "rgba(0, 0, 0, 1)");
+            try g.addColorStop(0.4, "rgba(255, 128, 64, 0.5)");
+            try g.addColorStop(1.0, "#ffffff");
+            g.setSpread(spread);
+            g.setSampling(sampling);
+            var r = radialWithAllocator(ta, 60, 50, 0, 64, 52, 45);
+            defer r.deinit();
+            try r.addColorStop(0.0, "rgba(0, 0, 0, 1)");
+            try r.addColorStop(0.4, "rgba(255, 128, 64, 0.5)");
+            try r.addColorStop(1.0, "#ffffff");
+            r.setSpread(spread);
+            r.setSampling(sampling);
+            var worst: u32 = 0;
+            var y: f64 = -3.5;
+            while (y < 110) : (y += 7.25) {
+                g.sampleLinearRow(-20.5, y, &row);
+                for (&ref, 0..) |*o, i| o.* = g.sampleLinear(-20.5 + @as(f64, @floatFromInt(i)), y);
+                worst = @max(worst, maxChannelDelta(&ref, &row));
+                r.sampleRadialRow(-20.5, y, &row);
+                for (&ref, 0..) |*o, i| o.* = r.sampleRadial(-20.5 + @as(f64, @floatFromInt(i)), y);
+                worst = @max(worst, maxChannelDelta(&ref, &row));
+            }
+            // f32 along the row against f64 per pixel: the parameter can
+            // land one ramp entry over at a rounding boundary, and the ramp
+            // above steps by at most a few LSB per entry.
+            try std.testing.expect(worst <= 4);
+        }
+    }
+}
+
+test "a stop added under .lut256 marks the ramp stale; prepare rebuilds it" {
+    const ta = std.testing.allocator;
+    var g = linearWithAllocator(ta, 0, 0, 10, 0);
+    defer g.deinit();
+    try g.addColorStop(0.0, "#000000");
+    try g.addColorStop(1.0, "#ffffff");
+    g.setSampling(.lut256);
+    try std.testing.expect(!g.lut_dirty);
+    try g.addColorStop(0.5, "#ff0000");
+    try std.testing.expect(g.lut_dirty);
+    // Stale ramp: sampling scans the stops exactly.
+    try std.testing.expectEqual(@as(u32, 0xFF0000FF), g.sampleLinear(5, 0));
+    g.prepare();
+    try std.testing.expect(!g.lut_dirty);
+    // Fresh ramp: the sample is the ramp entry for t = 0.5 (index 128,
+    // which sits a hair past the red stop).
+    try std.testing.expectEqual(g.lut.?[128], g.sampleLinear(5, 0));
+}
+
+fn maxChannelDelta(a: []const u32, b: []const u32) u32 {
+    var m: u32 = 0;
+    for (a, b) |x, y| {
+        inline for (0..4) |ch| {
+            const shift: u5 = @intCast(ch * 8);
+            const xa: i32 = @intCast((x >> shift) & 0xFF);
+            const yb: i32 = @intCast((y >> shift) & 0xFF);
+            m = @max(m, @as(u32, @intCast(@abs(xa - yb))));
+        }
+    }
+    return m;
 }

@@ -160,17 +160,11 @@ inline fn dispatchShader(
     while (off < row.len) {
         const n = @min(row.len - off, ROW_CHUNK);
         const src = src_stack[0..n];
-        for (src, 0..) |*s, i| {
-            const px: f64 = @as(f64, @floatFromInt(x_start + @as(i32, @intCast(off + i)))) + 0.5;
-            s.* = switch (paint.shader) {
-                .gradient => |g| switch (g.geometry) {
-                    .linear => g.sampleLinear(px, py),
-                    .radial => g.sampleRadial(px, py),
-                    .conic => g.sampleConic(px, py),
-                },
-                .pattern => |pat| pat.sample(px, py),
-                .solid => unreachable,
-            };
+        const px0: f64 = @as(f64, @floatFromInt(x_start + @as(i32, @intCast(off)))) + 0.5;
+        switch (paint.shader) {
+            .gradient => |g| g.sampleRow(px0, py, src),
+            .pattern => |pat| pat.sampleRow(px0, py, src),
+            .solid => unreachable,
         }
         const cov_slice: ?[]const u8 = if (coverage) |c| c[off..][0..n] else null;
         const clip_slice: ?[]const u8 = if (clip_row) |c| c[off..][0..n] else null;

@@ -162,57 +162,94 @@ pub fn sampleRow(self: *const SmPattern, x_start: f64, y: f64, out: []u32) void 
     }
 }
 
-/// One texel axis walked along the row: wrapped into [0, n) once, then
-/// stepped with a compare per pixel (the step is first folded into
-/// (-n, n) so one compare suffices). Non-tiled axes step unwrapped and
-/// range-check per pixel.
-const AxisWalk = struct {
-    u: f64,
-    du: f64,
-    n: f64,
+/// One texel axis along the row in 32.32 fixed point, four pixels per
+/// step. A tiled axis is wrapped into [0, n) once and its step folded
+/// into [0, n), so four consecutive values lie in [0, 4n) and wrap with
+/// three compares; a non-tiled axis steps unwrapped and range-checks
+/// per lane (-1 = outside). Every lane is computed from the block base,
+/// not from the previous pixel: the old f64 walk was a serial add chain
+/// the core could not overlap, and it lost to the per-pixel matrix.
+const Axis4 = struct {
+    const V = @Vector(4, i64);
+    const one: i64 = 1 << 32;
+
+    base: i64,
+    du: i64,
+    n: i64,
     tiled: bool,
 
-    fn init(u_start: f64, du: f64, n: u32, tiled: bool) AxisWalk {
+    /// Null when the coordinates are too large for the fixed point (a
+    /// non-tiled axis a billion texels out — the caller falls back).
+    fn init(u_start: f64, du: f64, n: u32, tiled: bool) ?Axis4 {
         const nf: f64 = @floatFromInt(n);
-        if (!tiled) return .{ .u = u_start, .du = du, .n = nf, .tiled = false };
-        var u = @mod(u_start, nf);
-        if (u < 0 or u >= nf) u = 0;
-        var d = @mod(du, nf);
-        if (d < 0 or d >= nf) d = 0;
-        return .{ .u = u, .du = d, .n = nf, .tiled = true };
+        var u = u_start;
+        var d = du;
+        if (tiled) {
+            u = @mod(u_start, nf);
+            if (u < 0 or u >= nf) u = 0;
+            d = @mod(du, nf);
+            if (d < 0 or d >= nf) d = 0;
+        } else if (@abs(u_start) > 1.0e9 or @abs(du) > 1.0e9) {
+            return null;
+        }
+        return .{ .base = fx(u), .du = fx(d), .n = @as(i64, n) * one, .tiled = tiled };
     }
 
-    inline fn step(self: *AxisWalk) void {
-        self.u += self.du;
-        if (self.tiled and self.u >= self.n) self.u -= self.n;
+    inline fn fx(v: f64) i64 {
+        return @intFromFloat(@floor(v * 4294967296.0));
     }
 
-    /// The texel index, or null off a non-tiled axis.
-    inline fn index(self: *const AxisWalk) ?usize {
-        if (self.tiled) return @intFromFloat(self.u);
-        if (self.u < 0 or self.u >= self.n) return null;
-        return @intFromFloat(@floor(self.u));
+    /// Texel indices of the next four pixels (-1 off a non-tiled axis).
+    inline fn next4(self: *Axis4) V {
+        const lane: V = .{ 0, 1, 2, 3 };
+        var u: V = @as(V, @splat(self.base)) + lane * @as(V, @splat(self.du));
+        const nv: V = @splat(self.n);
+        if (self.tiled) {
+            u = @select(i64, u >= nv, u - nv, u);
+            u = @select(i64, u >= nv, u - nv, u);
+            u = @select(i64, u >= nv, u - nv, u);
+            var nb = self.base + 4 * self.du;
+            while (nb >= self.n) nb -= self.n;
+            self.base = nb;
+            return u >> @splat(32);
+        }
+        self.base += 4 * self.du;
+        const idx = u >> @splat(32);
+        const ok_lo = u >= @as(V, @splat(0));
+        const ok_hi = u < nv;
+        return @select(i64, ok_lo, @select(i64, ok_hi, idx, @as(V, @splat(-1))), @as(V, @splat(-1)));
     }
 };
 
 fn sampleNearestRow(self: *const SmPattern, sx0: f64, sy0: f64, dsx: f64, dsy: f64, out: []u32) void {
     const tile_x = self.repetition == .repeat or self.repetition == .repeat_x;
     const tile_y = self.repetition == .repeat or self.repetition == .repeat_y;
-    var ax = AxisWalk.init(sx0, dsx, self.width, tile_x);
-    var ay = AxisWalk.init(sy0, dsy, self.height, tile_y);
+    var ax = Axis4.init(sx0, dsx, self.width, tile_x) orelse return self.sampleNearestRowScalar(sx0, sy0, dsx, dsy, out);
+    var ay = Axis4.init(sy0, dsy, self.height, tile_y) orelse return self.sampleNearestRowScalar(sx0, sy0, dsx, dsy, out);
     const w: usize = self.width;
-    for (out) |*o| {
-        const ix = ax.index();
-        const iy = ay.index();
-        if (ix != null and iy != null) {
-            const idx = (iy.? * w + ix.?) * 4;
-            const px: [4]u8 = self.data[idx..][0..4].*;
-            o.* = @bitCast(px);
-        } else {
-            o.* = 0;
+    var i: usize = 0;
+    while (i + 4 <= out.len) : (i += 4) {
+        const xi: [4]i64 = ax.next4();
+        const yi: [4]i64 = ay.next4();
+        inline for (0..4) |k| {
+            if (xi[k] < 0 or yi[k] < 0) {
+                out[i + k] = 0;
+            } else {
+                const idx = (@as(usize, @intCast(yi[k])) * w + @as(usize, @intCast(xi[k]))) * 4;
+                out[i + k] = @bitCast(self.data[idx..][0..4].*);
+            }
         }
-        ax.step();
-        ay.step();
+    }
+    while (i < out.len) : (i += 1) {
+        const fi: f64 = @floatFromInt(i);
+        out[i] = self.sampleNearest(sx0 + fi * dsx, sy0 + fi * dsy);
+    }
+}
+
+fn sampleNearestRowScalar(self: *const SmPattern, sx0: f64, sy0: f64, dsx: f64, dsy: f64, out: []u32) void {
+    for (out, 0..) |*o, i| {
+        const fi: f64 = @floatFromInt(i);
+        o.* = self.sampleNearest(sx0 + fi * dsx, sy0 + fi * dsy);
     }
 }
 
@@ -221,16 +258,17 @@ fn sampleBilinearRow(self: *const SmPattern, sx0: f64, sy0: f64, dsx: f64, dsy: 
     const tile_y = self.repetition == .repeat or self.repetition == .repeat_y;
     const w_i: i64 = @intCast(self.width);
     const h_i: i64 = @intCast(self.height);
-    // The -0.5 puts texel centres at integer offsets (see sampleBilinear).
-    var ax = AxisWalk.init(sx0 - 0.5, dsx, self.width, tile_x);
-    var ay = AxisWalk.init(sy0 - 0.5, dsy, self.height, tile_y);
     const w: usize = self.width;
-    const inv255: f32 = 1.0 / 255.0;
-    for (out) |*o| {
-        const ufl = @floor(ax.u);
-        const vfl = @floor(ay.u);
-        const fx: f32 = @floatCast(ax.u - ufl);
-        const fy: f32 = @floatCast(ay.u - vfl);
+    for (out, 0..) |*o, i| {
+        // Each pixel from the row base (no serial chain); the -0.5 puts
+        // texel centres at integer offsets (see sampleBilinear).
+        const fi: f64 = @floatFromInt(i);
+        const u = sx0 - 0.5 + fi * dsx;
+        const v = sy0 - 0.5 + fi * dsy;
+        const ufl = @floor(u);
+        const vfl = @floor(v);
+        const fx: f32 = @floatCast(u - ufl);
+        const fy: f32 = @floatCast(v - vfl);
         const x0: i64 = @intFromFloat(ufl);
         const y0: i64 = @intFromFloat(vfl);
         const xs = [2]?i64{ resolveTap(x0, w_i, tile_x), resolveTap(x0 + 1, w_i, tile_x) };
@@ -269,9 +307,6 @@ fn sampleBilinearRow(self: *const SmPattern, sx0: f64, sy0: f64, dsx: f64, dsy: 
         } else {
             o.* = 0;
         }
-        _ = inv255;
-        ax.step();
-        ay.step();
     }
 }
 

@@ -58,6 +58,7 @@ pub const StateFrame = struct {
     clipMask: ?[]u8,
     clipOwned: bool,
     clipBox: SmScan.RowBox,
+    clipRectOnly: bool,
     alpha: u8,
     blendMode: SmPaint.BlendMode,
     cxform: SmPaint.ColorTransform,
@@ -156,6 +157,10 @@ clip_mask: ?[]u8 = null,
 clip_owned: bool = true,
 /// The half-open box of the clip mask's non-zero bytes (see SmBlitter.Clip).
 clip_box: SmScan.RowBox = .{},
+/// A clip that is the box alone — an integer rectangle, which every
+/// scrollRect, mask bound and layer bound is — with no mask allocated.
+/// Only `clip_box` is consulted; `clip_mask` is null.
+clip_rect_only: bool = false,
 /// HTML5 `imageSmoothingEnabled`. Default true — drawImage uses bilinear
 /// sampling. When false, drawImage uses nearest-neighbor (blocky scale-up).
 imageSmoothingEnabled: bool = true,
@@ -441,6 +446,7 @@ pub fn reset(self: *SmCanvas) void {
     }
     self.clip_owned = true;
     self.clip_box = .{};
+    self.clip_rect_only = false;
     self.line_dash_storage.len = 0;
     self.filter_verbs.len = 0;
     self.filter_params.len = 0;
@@ -639,6 +645,7 @@ pub fn save(self: *SmCanvas) void {
         .clipMask = saved_clip,
         .clipOwned = saved_clip_owned,
         .clipBox = self.clip_box,
+        .clipRectOnly = self.clip_rect_only,
         .alpha = self.alpha,
         .blendMode = self.blendMode,
         .cxform = self.cxform,
@@ -686,6 +693,7 @@ pub fn restore(self: *SmCanvas) void {
     self.clip_mask = frame.clipMask;
     self.clip_owned = frame.clipOwned;
     self.clip_box = frame.clipBox;
+    self.clip_rect_only = frame.clipRectOnly;
     self.alpha = frame.alpha;
     self.blendMode = frame.blendMode;
     self.cxform = frame.cxform;
@@ -1799,8 +1807,46 @@ pub fn clipPath(self: *SmCanvas, path: *const SmPath, fill_rule: SmScan.FillRule
 
 /// The active clip as the blitter sees it: mask plus box.
 pub fn clipRef(self: *const SmCanvas) ?SmBlitter.Clip {
-    const m = self.clip_mask orelse return null;
-    return .{ .mask = m, .x0 = self.clip_box.x0, .y0 = self.clip_box.y0, .x1 = self.clip_box.x1, .y1 = self.clip_box.y1 };
+    if (self.clip_mask == null and !self.clip_rect_only) return null;
+    return .{ .mask = self.clip_mask, .x0 = self.clip_box.x0, .y0 = self.clip_box.y0, .x1 = self.clip_box.x1, .y1 = self.clip_box.y1 };
+}
+
+/// Whether any clip is active (a mask or a box).
+pub fn hasClip(self: *const SmCanvas) bool {
+    return self.clip_mask != null or self.clip_rect_only;
+}
+
+/// Install a ready coverage mask as the clip — one a caller kept from
+/// an earlier `clip()` whose geometry has not changed — intersected
+/// with the active clip. The mask is BORROWED (never freed here, never
+/// mutated) unless an intersection with an existing mask has to build
+/// a new one. `box` is the box of its non-zero bytes.
+pub fn clipWithMask(self: *SmCanvas, mask: []u8, box: SmScan.RowBox) void {
+    const allocator = self.surface.getAllocator();
+    const w: usize = self.surface.width;
+    if (self.clip_mask) |existing| {
+        const total: usize = w * @as(usize, self.surface.height);
+        const inter = box.intersect(self.clip_box);
+        const new_mask = allocator.alloc(u8, total) catch return;
+        @memset(new_mask, 0);
+        var y = inter.y0;
+        while (y < inter.y1) : (y += 1) {
+            const off = @as(usize, @intCast(y)) * w;
+            const lo = off + @as(usize, @intCast(inter.x0));
+            const hi = off + @as(usize, @intCast(inter.x1));
+            simd.clipCombineU8(new_mask[lo..hi], mask[lo..hi], existing[lo..hi]);
+        }
+        if (self.clip_owned) allocator.free(existing);
+        self.clip_mask = new_mask;
+        self.clip_owned = true;
+        self.clip_box = inter;
+        self.clip_rect_only = false;
+        return;
+    }
+    self.clip_mask = mask;
+    self.clip_owned = false;
+    self.clip_box = if (self.clip_rect_only) box.intersect(self.clip_box) else box;
+    self.clip_rect_only = false;
 }
 
 /// A path that is one axis-aligned rectangle on integer coordinates,
@@ -1835,19 +1881,19 @@ fn clipInternal(self: *SmCanvas, path: *const SmPath, fill_rule: SmScan.FillRule
     const w: usize = self.surface.width;
     const total: usize = w * @as(usize, self.surface.height);
     if (total == 0) return;
-    // Rasterize the new clip path into a fresh zeroed buffer — or, for
-    // an integer rectangle, write its rows directly (no sweep).
+    // An integer rectangle is a box-only clip: nothing is allocated or
+    // written. Intersecting with an existing clip only shrinks the box —
+    // a mask's bytes outside the box are never consulted (SmBlitter.Clip).
+    if (self.integerRect(path)) |r| {
+        self.clip_box = if (self.hasClip()) self.clip_box.intersect(r) else r;
+        if (self.clip_mask == null) self.clip_rect_only = true;
+        return;
+    }
+    // Rasterize the new clip path into a fresh zeroed buffer.
     const new_mask = allocator.alloc(u8, total) catch return;
     @memset(new_mask, 0);
     var box: SmScan.RowBox = .{};
-    if (self.integerRect(path)) |r| {
-        box = r;
-        var y = r.y0;
-        while (y < r.y1) : (y += 1) {
-            const off = @as(usize, @intCast(y)) * w;
-            @memset(new_mask[off + @as(usize, @intCast(r.x0)) .. off + @as(usize, @intCast(r.x1))], 0xFF);
-        }
-    } else {
+    {
         SmScan.fillPathToCoverageBox(
             allocator,
             new_mask,
@@ -1878,10 +1924,13 @@ fn clipInternal(self: *SmCanvas, path: *const SmPath, fill_rule: SmScan.FillRule
         }
         box = box.intersect(self.clip_box);
         if (self.clip_owned) allocator.free(existing);
+    } else if (self.clip_rect_only) {
+        box = box.intersect(self.clip_box);
     }
     self.clip_mask = new_mask;
     self.clip_owned = true;
     self.clip_box = box;
+    self.clip_rect_only = false;
 }
 
 // --- HTML5-shaped sugar (build a SmPaint from current ctx state) ---------
@@ -2168,7 +2217,7 @@ pub fn drawImageScaledSub(
     // Per-row src scratch buffer — small stack array for typical canvas
     // widths, heap fallback for wider rows. Mirrors the snapshot pattern
     // the legacy clip-aware drawImage used.
-    const clip_mask = self.clip_mask;
+    const clip_ref = self.clipRef();
     const allocator = self.surface.getAllocator();
     var stack_src: [1024]u32 = undefined;
     const heap_src: ?[]u32 = if (row_len > stack_src.len) (allocator.alloc(u32, row_len) catch null) else null;
@@ -2190,22 +2239,65 @@ pub fn drawImageScaledSub(
         .dst_color_type = self.surface.color_type,
     };
 
+    // ONE-TO-ONE: an untransformed, unscaled draw at whole-pixel offsets
+    // maps every destination pixel to exactly one texel, so the source
+    // rows are handed to the blitter directly — no sampling, no scratch.
+    // The sampled path gives the same bytes (nearest lands on the texel;
+    // bilinear at a texel centre weights it 1), which the test pins.
+    const ctm = self.current_transform;
+    const one_to_one = !disable_blit_fast_path and
+        ctm.a == 1 and ctm.b == 0 and ctm.c == 0 and ctm.d == 1 and
+        isWhole(ctm.e) and isWhole(ctm.f) and
+        sw == dw and sh == dh and isWhole(sx) and isWhole(sy) and isWhole(dx) and isWhole(dy) and
+        @abs(sx) < 1.0e9 and @abs(sy) < 1.0e9 and @abs(dx + ctm.e) < 1.0e9 and @abs(dy + ctm.f) < 1.0e9;
+    const src_dx: i64 = if (one_to_one) @as(i64, @intFromFloat(sx)) - @as(i64, @intFromFloat(dx + ctm.e)) else 0;
+    const src_dy: i64 = if (one_to_one) @as(i64, @intFromFloat(sy)) - @as(i64, @intFromFloat(dy + ctm.f)) else 0;
+    const src_x_lo: i64 = if (one_to_one) @intFromFloat(sx) else 0;
+    const src_x_hi: i64 = if (one_to_one) @intFromFloat(sx + sw) else 0;
+    const src_y_lo: i64 = if (one_to_one) @intFromFloat(sy) else 0;
+    const src_y_hi: i64 = if (one_to_one) @intFromFloat(sy + sh) else 0;
+
     var py: i32 = dst_y0_i;
     while (py < dst_y1_i) : (py += 1) {
-        // Rows outside the clip's box are not even sampled.
-        if (clip_mask != null and (py < self.clip_box.y0 or py >= self.clip_box.y1)) continue;
+        // Rows outside the clip's box are not even sampled, and a row
+        // is trimmed to the box before anything reads it.
+        var x_lo = dst_x0_i;
+        var x_hi = dst_x1_i;
+        if (clip_ref) |c| {
+            if (py < c.y0 or py >= c.y1) continue;
+            x_lo = @max(x_lo, c.x0);
+            x_hi = @min(x_hi, c.x1);
+            if (x_hi <= x_lo) continue;
+        }
+        const span: usize = @intCast(x_hi - x_lo);
         const row_off: usize =
             @as(usize, @intCast(py)) * @as(usize, self.surface.width) +
-            @as(usize, @intCast(dst_x0_i));
-        const dst_row = self.pixels[row_off..][0..row_len];
+            @as(usize, @intCast(x_lo));
+        const dst_row = self.pixels[row_off..][0..span];
+        const clip_row: ?[]const u8 = if (clip_ref) |c| (if (c.mask) |m| m[row_off..][0..span] else null) else null;
+
+        if (one_to_one) {
+            const sy_i = @as(i64, py) + src_dy;
+            const sx0 = @as(i64, x_lo) + src_dx;
+            const sx1 = sx0 + @as(i64, @intCast(span));
+            if (sy_i >= src_y_lo and sy_i < src_y_hi and sy_i >= 0 and sy_i < bitmap.height and
+                sx0 >= src_x_lo and sx1 <= src_x_hi and sx0 >= 0 and sx1 <= bitmap.width)
+            {
+                const src_off: usize = @as(usize, @intCast(sy_i)) * @as(usize, bitmap.width) + @as(usize, @intCast(sx0));
+                SmBlitter.blitRowFromSource(dst_row, src_pixels[src_off..][0..span], &draw_paint, clip_row);
+                continue;
+            }
+            // Partly outside the source: the sampler handles the edge.
+        }
 
         // Zero the scratch — `sampleImageRow` skips out-of-source-rect
         // pixels rather than writing transparent, so prior-row residue
         // would leak otherwise.
-        @memset(src_buf, 0);
+        const src_row = src_buf[0..span];
+        @memset(src_row, 0);
         sampleImageRow(
             self.imageSmoothingEnabled,
-            src_buf,
+            src_row,
             src_pixels,
             bitmap.width,
             bitmap.height,
@@ -2219,14 +2311,20 @@ pub fn drawImageScaledSub(
             inv.d,
             inv.e,
             inv.f,
-            dst_x0_i,
+            x_lo,
             py,
         );
-
-        const clip_row: ?[]const u8 = if (clip_mask) |cm| cm[row_off..][0..row_len] else null;
-        SmBlitter.blitRowFromSource(dst_row, src_buf, &draw_paint, clip_row);
+        SmBlitter.blitRowFromSource(dst_row, src_row, &draw_paint, clip_row);
     }
 }
+
+inline fn isWhole(v: f64) bool {
+    return std.math.isFinite(v) and @floor(v) == v;
+}
+
+/// Test knob: force the sampled path so the one-to-one blit can be
+/// compared against it.
+pub var disable_blit_fast_path: bool = false;
 
 /// Pick between bilinear (smoothing on) and nearest (smoothing off) row
 /// samplers. Tiny indirection so the two call sites stay symmetric.
@@ -2579,36 +2677,102 @@ pub fn fillTextWithSpacing(
 
 // --- Clip tests (run through tests_libc.zig: the canvas links stb) ------
 
-test "clip: an integer rectangle takes the fast path and equals the swept mask, box included" {
-    const ta = std.testing.allocator;
-    var surface = try SmSurface.init(ta, 40, 30);
-    defer surface.deinit();
-    var c = SmCanvas.initFromSurface(&surface);
-    defer c.deinit();
+/// A triangle-ish shape crossing the rectangle (5,7)-(17,16), filled
+/// opaque so the clip's effect is exact.
+fn fillTestShape(c: *SmCanvas) void {
+    c.setFillStyle(230, 90, 40, 255);
     c.beginPath();
-    c.rect(5, 7, 12, 9);
-    c.clip(.nonzero);
-    try std.testing.expect(c.clip_mask != null);
-    try std.testing.expectEqual(SmScan.RowBox{ .x0 = 5, .y0 = 7, .x1 = 17, .y1 = 16 }, c.clip_box);
+    c.moveTo(2, 4);
+    c.lineTo(30, 6);
+    c.lineTo(20, 26);
+    c.lineTo(3, 20);
+    c.closePath();
+    c.fill(.nonzero);
+}
 
-    var path = SmPath.emptyWithAllocator(ta);
-    defer path.deinit();
-    path.rect(5, 7, 12, 9);
-    const mask = try ta.alloc(u8, 40 * 30);
-    defer ta.free(mask);
-    @memset(mask, 0);
-    var box: SmScan.RowBox = .{};
-    try SmScan.fillPathToCoverageBox(ta, mask, 40, 30, &path, .nonzero, true, .analytic, &box);
-    try std.testing.expectEqualSlices(u8, mask, c.clip_mask.?);
-    try std.testing.expectEqual(c.clip_box, box);
+/// The same rectangle as a moveTo/lineTo path, which takes the sweep
+/// and produces a mask.
+fn clipRectViaPath(c: *SmCanvas, x: f64, y: f64, w: f64, h: f64) void {
+    c.beginPath();
+    c.moveTo(x, y);
+    c.lineTo(x + w, y);
+    c.lineTo(x + w, y + h);
+    c.lineTo(x, y + h);
+    c.closePath();
+    c.clip(.nonzero);
+}
+
+test "clip: an integer rectangle is a box-only clip and fills under it equal fills under the swept mask" {
+    const ta = std.testing.allocator;
+    var sa = try SmSurface.init(ta, 40, 30);
+    defer sa.deinit();
+    var a = SmCanvas.initFromSurface(&sa);
+    defer a.deinit();
+    a.beginPath();
+    a.rect(5, 7, 12, 9);
+    a.clip(.nonzero);
+    try std.testing.expect(a.clip_mask == null);
+    try std.testing.expect(a.clip_rect_only);
+    try std.testing.expectEqual(SmScan.RowBox{ .x0 = 5, .y0 = 7, .x1 = 17, .y1 = 16 }, a.clip_box);
+    fillTestShape(&a);
+
+    var sb = try SmSurface.init(ta, 40, 30);
+    defer sb.deinit();
+    var b = SmCanvas.initFromSurface(&sb);
+    defer b.deinit();
+    clipRectViaPath(&b, 5, 7, 12, 9);
+    try std.testing.expect(b.clip_mask != null);
+    try std.testing.expectEqual(a.clip_box, b.clip_box);
+    fillTestShape(&b);
+    try std.testing.expectEqualSlices(u32, b.pixels, a.pixels);
+    // Something was actually drawn, and only inside the box.
+    try std.testing.expect(a.pixels[10 * 40 + 10] != 0);
+    try std.testing.expectEqual(@as(u32, 0), a.pixels[20 * 40 + 10]);
 
     // A fractional rectangle takes the sweep and has partial edge bytes.
-    c.beginPath();
-    c.rect(5.5, 7, 12, 9);
-    c.clip(.nonzero);
-    const m = c.clip_mask.?;
+    a.beginPath();
+    a.rect(5.5, 7, 12, 9);
+    a.clip(.nonzero);
+    const m = a.clip_mask.?;
+    try std.testing.expect(!a.clip_rect_only);
     try std.testing.expect(m[8 * 40 + 5] > 0 and m[8 * 40 + 5] < 255);
-    try std.testing.expectEqual(SmScan.RowBox{ .x0 = 5, .y0 = 7, .x1 = 17, .y1 = 16 }, c.clip_box);
+    try std.testing.expectEqual(SmScan.RowBox{ .x0 = 5, .y0 = 7, .x1 = 17, .y1 = 16 }, a.clip_box);
+}
+
+test "clip: rectangles intersect boxes without allocating; a rect then a mask, a mask then a rect" {
+    const ta = std.testing.allocator;
+    var sa = try SmSurface.init(ta, 40, 30);
+    defer sa.deinit();
+    var a = SmCanvas.initFromSurface(&sa);
+    defer a.deinit();
+    a.beginPath();
+    a.rect(0, 0, 20, 20);
+    a.clip(.nonzero);
+    a.beginPath();
+    a.rect(10, 10, 20, 20);
+    a.clip(.nonzero);
+    try std.testing.expect(a.clip_mask == null);
+    try std.testing.expectEqual(SmScan.RowBox{ .x0 = 10, .y0 = 10, .x1 = 20, .y1 = 20 }, a.clip_box);
+    // Rect then mask: the mask's box shrinks to the intersection.
+    clipRectViaPath(&a, 5, 5, 30, 30);
+    try std.testing.expect(a.clip_mask != null);
+    try std.testing.expectEqual(SmScan.RowBox{ .x0 = 10, .y0 = 10, .x1 = 20, .y1 = 20 }, a.clip_box);
+    fillTestShape(&a);
+
+    // Mask then rect gives the same picture: the mask stays, the box shrinks.
+    var sb = try SmSurface.init(ta, 40, 30);
+    defer sb.deinit();
+    var b = SmCanvas.initFromSurface(&sb);
+    defer b.deinit();
+    clipRectViaPath(&b, 5, 5, 30, 30);
+    const mask_ptr = b.clip_mask.?.ptr;
+    b.beginPath();
+    b.rect(10, 10, 10, 10);
+    b.clip(.nonzero);
+    try std.testing.expect(b.clip_mask.?.ptr == mask_ptr);
+    try std.testing.expectEqual(SmScan.RowBox{ .x0 = 10, .y0 = 10, .x1 = 20, .y1 = 20 }, b.clip_box);
+    fillTestShape(&b);
+    try std.testing.expectEqualSlices(u32, a.pixels, b.pixels);
 }
 
 test "clip: save shares the mask, a clip under save leaves the shared one alone, restore frees only what it owns" {
@@ -2617,9 +2781,7 @@ test "clip: save shares the mask, a clip under save leaves the shared one alone,
     defer surface.deinit();
     var c = SmCanvas.initFromSurface(&surface);
     defer c.deinit();
-    c.beginPath();
-    c.rect(0, 0, 20, 20);
-    c.clip(.nonzero);
+    clipRectViaPath(&c, 0.5, 0, 20, 20);
     const m0 = c.clip_mask.?.ptr;
     try std.testing.expect(c.clip_owned);
 
@@ -2629,15 +2791,12 @@ test "clip: save shares the mask, a clip under save leaves the shared one alone,
     c.save();
     try std.testing.expect(!c.clip_owned);
 
-    c.beginPath();
-    c.rect(10, 10, 20, 20);
-    c.clip(.nonzero);
+    clipRectViaPath(&c, 10.5, 10, 20, 20);
     try std.testing.expect(c.clip_owned);
     try std.testing.expect(c.clip_mask.?.ptr != m0);
-    try std.testing.expectEqual(SmScan.RowBox{ .x0 = 10, .y0 = 10, .x1 = 20, .y1 = 20 }, c.clip_box);
+    try std.testing.expectEqual(SmScan.RowBox{ .x0 = 10, .y0 = 10, .x1 = 21, .y1 = 20 }, c.clip_box);
     try std.testing.expectEqual(@as(u8, 255), c.clip_mask.?[15 * 32 + 15]);
     try std.testing.expectEqual(@as(u8, 0), c.clip_mask.?[25 * 32 + 25]);
-    try std.testing.expectEqual(@as(u8, 0), c.clip_mask.?[5 * 32 + 5]);
 
     c.restore();
     try std.testing.expect(c.clip_mask.?.ptr == m0);
@@ -2645,9 +2804,22 @@ test "clip: save shares the mask, a clip under save leaves the shared one alone,
     c.restore();
     try std.testing.expect(c.clip_mask.?.ptr == m0);
     try std.testing.expect(c.clip_owned);
-    try std.testing.expectEqual(SmScan.RowBox{ .x0 = 0, .y0 = 0, .x1 = 20, .y1 = 20 }, c.clip_box);
     // deinit frees m0 exactly once (the testing allocator reports leaks
     // and double frees).
+
+    // A box-only clip survives save/restore too.
+    c.reset();
+    c.beginPath();
+    c.rect(2, 2, 8, 8);
+    c.clip(.nonzero);
+    c.save();
+    c.beginPath();
+    c.rect(4, 4, 2, 2);
+    c.clip(.nonzero);
+    try std.testing.expectEqual(SmScan.RowBox{ .x0 = 4, .y0 = 4, .x1 = 6, .y1 = 6 }, c.clip_box);
+    c.restore();
+    try std.testing.expect(c.clip_rect_only and c.clip_mask == null);
+    try std.testing.expectEqual(SmScan.RowBox{ .x0 = 2, .y0 = 2, .x1 = 10, .y1 = 10 }, c.clip_box);
 }
 
 test "clip: an empty rectangle clips everything; fills under it touch no pixel" {
@@ -2664,4 +2836,115 @@ test "clip: an empty rectangle clips everything; fills under it touch no pixel" 
     c.rect(0, 0, 16, 16);
     c.fill(.nonzero);
     for (c.pixels) |p| try std.testing.expectEqual(@as(u32, 0), p);
+}
+
+test "clipWithMask: a kept mask is borrowed, intersects a box, and combines with a mask" {
+    const ta = std.testing.allocator;
+    // The reference: a swept mask clip, drawn through.
+    var sr = try SmSurface.init(ta, 40, 30);
+    defer sr.deinit();
+    var r = SmCanvas.initFromSurface(&sr);
+    defer r.deinit();
+    r.beginPath();
+    r.moveTo(4, 3);
+    r.lineTo(34, 8);
+    r.lineTo(22, 27);
+    r.closePath();
+    r.clip(.nonzero);
+    const kept = try ta.dupe(u8, r.clip_mask.?);
+    defer ta.free(kept);
+    const kept_box = r.clip_box;
+    fillTestShape(&r);
+
+    // Borrowed: same pixels, nothing owned.
+    var sa = try SmSurface.init(ta, 40, 30);
+    defer sa.deinit();
+    var a = SmCanvas.initFromSurface(&sa);
+    defer a.deinit();
+    a.clipWithMask(kept, kept_box);
+    try std.testing.expect(!a.clip_owned);
+    try std.testing.expect(a.clip_mask.?.ptr == kept.ptr);
+    fillTestShape(&a);
+    try std.testing.expectEqualSlices(u32, r.pixels, a.pixels);
+
+    // Under a box-only clip: the box shrinks, the mask is still borrowed.
+    var sb = try SmSurface.init(ta, 40, 30);
+    defer sb.deinit();
+    var b = SmCanvas.initFromSurface(&sb);
+    defer b.deinit();
+    b.beginPath();
+    b.rect(10, 5, 20, 12);
+    b.clip(.nonzero);
+    b.clipWithMask(kept, kept_box);
+    try std.testing.expect(!b.clip_owned);
+    try std.testing.expectEqual(kept_box.intersect(.{ .x0 = 10, .y0 = 5, .x1 = 30, .y1 = 17 }), b.clip_box);
+    fillTestShape(&b);
+    // Equals the reference restricted to the rect.
+    var sc = try SmSurface.init(ta, 40, 30);
+    defer sc.deinit();
+    var c = SmCanvas.initFromSurface(&sc);
+    defer c.deinit();
+    c.beginPath();
+    c.rect(10, 5, 20, 12);
+    c.clip(.nonzero);
+    c.beginPath();
+    c.moveTo(4, 3);
+    c.lineTo(34, 8);
+    c.lineTo(22, 27);
+    c.closePath();
+    c.clip(.nonzero);
+    fillTestShape(&c);
+    try std.testing.expectEqualSlices(u32, c.pixels, b.pixels);
+
+    // Under a mask: a new owned mask is built (freed by deinit).
+    var sd = try SmSurface.init(ta, 40, 30);
+    defer sd.deinit();
+    var d = SmCanvas.initFromSurface(&sd);
+    defer d.deinit();
+    clipRectViaPath(&d, 0.5, 0, 25, 25);
+    d.clipWithMask(kept, kept_box);
+    try std.testing.expect(d.clip_owned);
+    try std.testing.expect(d.clip_mask.?.ptr != kept.ptr);
+}
+
+test "drawImage: the one-to-one blit equals the sampled path, smoothing on and off, under box and mask clips" {
+    const ta = std.testing.allocator;
+    var prng = std.Random.DefaultPrng.init(0xb117);
+    const rnd = prng.random();
+    var texels: [12 * 9 * 4]u8 = undefined;
+    for (&texels) |*t| t.* = rnd.int(u8);
+    const bitmap = SmBitmap{ .data = &texels, .width = 12, .height = 9, .pixelFormat = .rgba_unorm8 };
+    var backdrop: [40 * 30]u32 = undefined;
+    for (&backdrop) |*p| p.* = rnd.int(u32) | 0xFF000000;
+
+    inline for (.{ false, true }) |smooth| {
+        inline for (.{ 0, 1, 2 }) |clip_kind| {
+            var out: [2][40 * 30]u32 = undefined;
+            inline for (.{ false, true }) |slow| {
+                disable_blit_fast_path = slow;
+                var s = try SmSurface.init(ta, 40, 30);
+                defer s.deinit();
+                var c = SmCanvas.initFromSurface(&s);
+                defer c.deinit();
+                @memcpy(c.pixels, &backdrop);
+                c.imageSmoothingEnabled = smooth;
+                switch (clip_kind) {
+                    1 => {
+                        c.beginPath();
+                        c.rect(8, 6, 10, 7);
+                        c.clip(.nonzero);
+                    },
+                    2 => clipRectViaPath(&c, 7.5, 5, 12, 9),
+                    else => {},
+                }
+                c.setTransform(1, 0, 0, 1, 3, 2);
+                c.drawImageAt(bitmap, 4, 5);
+                // A sub-rect too, partly off the source's edge.
+                c.drawImageScaledSub(bitmap, 2, 1, 12, 9, 20, 15, 12, 9);
+                @memcpy(&out[if (slow) 1 else 0], c.pixels);
+            }
+            disable_blit_fast_path = false;
+            try std.testing.expectEqualSlices(u32, &out[1], &out[0]);
+        }
+    }
 }

@@ -44,12 +44,16 @@ const SmPaint = @import("SmPaint.zig");
 ///                          with `coverage` row-wise as
 ///                          `eff[i] = (coverage[i] * clip[i] + 127) / 255`
 ///                          — for binary clip values this is a pure mask.
-/// A clip mask with the bounding box (half-open) of its non-zero bytes.
-/// Rows and runs outside the box are skipped before a byte is read —
-/// exact for every blend mode, since a zero clip byte leaves the
-/// destination untouched in all of them.
+/// A clip: a half-open box, and optionally a coverage mask. Only bytes
+/// INSIDE the box are ever consulted — a run is trimmed to the box
+/// before the mask is read, so a mask may hold anything outside it —
+/// and a clip with no mask is the box alone (an integer rectangle:
+/// nothing allocated, nothing multiplied). Rows and runs outside the
+/// box are skipped before a byte is read, which is exact for every
+/// blend mode, since a zero clip byte leaves the destination untouched
+/// in all of them.
 pub const Clip = struct {
-    mask: []const u8,
+    mask: ?[]const u8,
     x0: i32,
     y0: i32,
     x1: i32,
@@ -68,24 +72,39 @@ pub const Clip = struct {
 pub fn blitRow(
     pixels: []u32,
     dst_w: u32,
-    x_start: i32,
+    x_in: i32,
     y: i32,
-    n: u32,
-    coverage: ?[]const u8,
+    n_in: u32,
+    coverage_in: ?[]const u8,
     paint: *const SmPaint,
     clip: ?Clip,
 ) void {
-    if (n == 0) return;
+    if (n_in == 0) return;
 
+    // Trim the run to the clip's box: what is left is blended as if
+    // unclipped when the clip has no mask, or through the mask's bytes
+    // inside the box.
+    var x_start = x_in;
+    var n = n_in;
+    var coverage = coverage_in;
+    var mask: ?[]const u8 = null;
+    if (clip) |c| {
+        if (c.excludes(x_in, y, n_in)) return;
+        const lo = @max(x_in, c.x0);
+        const hi = @min(x_in + @as(i32, @intCast(n_in)), c.x1);
+        if (lo != x_in or hi != x_in + @as(i32, @intCast(n_in))) {
+            const skip: usize = @intCast(lo - x_in);
+            n = @intCast(hi - lo);
+            if (coverage_in) |cv| coverage = cv[skip..][0..n];
+            x_start = lo;
+        }
+        mask = c.mask;
+    }
     const start_idx: usize =
         @as(usize, @intCast(y)) * @as(usize, dst_w) +
         @as(usize, @intCast(x_start));
     const row = pixels[start_idx..][0..n];
-    var clip_row: ?[]const u8 = null;
-    if (clip) |c| {
-        if (c.excludes(x_start, y, n)) return;
-        clip_row = c.mask[start_idx..][0..n];
-    }
+    const clip_row: ?[]const u8 = if (mask) |m| m[start_idx..][0..n] else null;
 
     // `.gradient` / `.pattern` shaders take the per-pixel path — they sample
     // a different source color at every (x, y), so the SIMD kernels (which
@@ -553,7 +572,8 @@ pub fn blitFullMaskedClip(
     var y: i32 = clip.y0;
     while (y < clip.y1) : (y += 1) {
         const off = @as(usize, @intCast(y)) * @as(usize, dst_w) + @as(usize, @intCast(clip.x0));
-        dispatchRowSrc(dst[off..][0..n], src[off..][0..n], clip.mask[off..][0..n], mode, ct);
+        const m: ?[]const u8 = if (clip.mask) |mk| mk[off..][0..n] else null;
+        dispatchRowSrc(dst[off..][0..n], src[off..][0..n], m, mode, ct);
     }
 }
 

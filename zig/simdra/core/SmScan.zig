@@ -1188,7 +1188,14 @@ fn sweepAnalytic(
             }
         }
         if (run_start >= 0) emit.run(canvas_w, run_start, y_int, cov_row[@intCast(run_start)..@intCast(x_end)]);
-        @memset(acc[@intCast(row_x_min)..@intCast(row_x_max)], 0.0);
+        // Clear only the cells the deposits touched: a wide fill's row
+        // is a few cells at each edge, not the whole width (the clear
+        // of the whole range was the largest memset in a Flash frame).
+        for (ivs.ptr[0..ivs.len]) |iv| {
+            const lo: usize = @intCast(@max(iv.lo, 0));
+            const hi: usize = @intCast(@min(iv.hi, row_x_max));
+            if (lo < hi) @memset(acc[lo..hi], 0.0);
+        }
     }
 }
 

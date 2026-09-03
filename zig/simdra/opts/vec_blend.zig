@@ -270,6 +270,9 @@ const Core = fn (sw: V32, dw: V32) callconv(.@"inline") V32;
 /// (the scalar row returns early), 255 lands on the source exactly.
 inline fn srcOverCore(sw: V32, dw: V32) V32 {
     const sa8 = alphaOf(sw);
+    // An opaque source over anything is the source: Flash's bitmap
+    // tiles are opaque, and their rows are copies.
+    if (allOpaque(sa8)) return sw;
     const da8 = alphaOf(dw);
     const inv_sa8 = @as(V8, @splat(255)) - sa8;
     const sa4 = bcast4(sa8);

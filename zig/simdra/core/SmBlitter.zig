@@ -44,6 +44,27 @@ const SmPaint = @import("SmPaint.zig");
 ///                          with `coverage` row-wise as
 ///                          `eff[i] = (coverage[i] * clip[i] + 127) / 255`
 ///                          — for binary clip values this is a pure mask.
+/// A clip mask with the bounding box (half-open) of its non-zero bytes.
+/// Rows and runs outside the box are skipped before a byte is read —
+/// exact for every blend mode, since a zero clip byte leaves the
+/// destination untouched in all of them.
+pub const Clip = struct {
+    mask: []const u8,
+    x0: i32,
+    y0: i32,
+    x1: i32,
+    y1: i32,
+
+    pub inline fn excludes(self: Clip, x_start: i32, y: i32, n: u32) bool {
+        return y < self.y0 or y >= self.y1 or x_start >= self.x1 or
+            x_start + @as(i32, @intCast(n)) <= self.x0;
+    }
+
+    pub inline fn isEmpty(self: Clip) bool {
+        return self.x0 >= self.x1 or self.y0 >= self.y1;
+    }
+};
+
 pub fn blitRow(
     pixels: []u32,
     dst_w: u32,
@@ -52,7 +73,7 @@ pub fn blitRow(
     n: u32,
     coverage: ?[]const u8,
     paint: *const SmPaint,
-    clip_mask: ?[]const u8,
+    clip: ?Clip,
 ) void {
     if (n == 0) return;
 
@@ -60,7 +81,11 @@ pub fn blitRow(
         @as(usize, @intCast(y)) * @as(usize, dst_w) +
         @as(usize, @intCast(x_start));
     const row = pixels[start_idx..][0..n];
-    const clip_row: ?[]const u8 = if (clip_mask) |cm| cm[start_idx..][0..n] else null;
+    var clip_row: ?[]const u8 = null;
+    if (clip) |c| {
+        if (c.excludes(x_start, y, n)) return;
+        clip_row = c.mask[start_idx..][0..n];
+    }
 
     // `.gradient` / `.pattern` shaders take the per-pixel path — they sample
     // a different source color at every (x, y), so the SIMD kernels (which
@@ -509,6 +534,27 @@ pub fn blitFullMasked(
     // lum-aware non-separable kernels; no source swizzling happens here);
     // the mask's skip/lerp rule lives in the row kernels.
     dispatchRowSrc(dst, src, mask, mode, ct);
+}
+
+/// `blitFullMasked` under a clip: only the rows and columns inside the
+/// clip's box are composited (outside it the mask is zero and every
+/// mode leaves the destination alone).
+pub fn blitFullMaskedClip(
+    dst: []u32,
+    src: []const u32,
+    mode: SmPaint.BlendMode,
+    ct: types.ColorType,
+    clip: Clip,
+    dst_w: u32,
+) void {
+    std.debug.assert(dst.len == src.len);
+    if (clip.isEmpty()) return;
+    const n: usize = @intCast(clip.x1 - clip.x0);
+    var y: i32 = clip.y0;
+    while (y < clip.y1) : (y += 1) {
+        const off = @as(usize, @intCast(y)) * @as(usize, dst_w) + @as(usize, @intCast(clip.x0));
+        dispatchRowSrc(dst[off..][0..n], src[off..][0..n], clip.mask[off..][0..n], mode, ct);
+    }
 }
 
 /// The per-pixel version, kept as the test's reference.

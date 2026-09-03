@@ -52,10 +52,12 @@ pub const StateFrame = struct {
     miterLimit: f64,
     lineDash: []f64,
     lineDashOffset: f64,
-    /// Snapshot of `clip_mask` at save time (deep-copied), or `null` if
-    /// no clip was active. Owned by the frame; freed on `restore()` after
-    /// the contents are swapped back into `clip_mask`.
+    /// The `clip_mask` at save time, shared (not copied) with the
+    /// canvas, or `null` if no clip was active. `clipOwned` says whether
+    /// this frame frees it; see `SmCanvas.clip_owned`.
     clipMask: ?[]u8,
+    clipOwned: bool,
+    clipBox: SmScan.RowBox,
     alpha: u8,
     blendMode: SmPaint.BlendMode,
     cxform: SmPaint.ColorTransform,
@@ -146,6 +148,14 @@ scratch_pixels: ?[]u32 = null,
 /// matching HTML5 monotone-restrictive clip semantics. Saved and restored
 /// by `save()` / `restore()` (deep-copy snapshots into `StateFrame`).
 clip_mask: ?[]u8 = null,
+/// Whether `clip_mask` is this canvas's to free. `save()` hands the
+/// mask to the frame and keeps sampling it borrowed (copy-on-write:
+/// the next `clip()` builds a new mask and frees this one only if
+/// owned); `restore()` takes the frame's mask back with its ownership.
+/// Exactly one holder owns each allocation.
+clip_owned: bool = true,
+/// The half-open box of the clip mask's non-zero bytes (see SmBlitter.Clip).
+clip_box: SmScan.RowBox = .{},
 /// HTML5 `imageSmoothingEnabled`. Default true — drawImage uses bilinear
 /// sampling. When false, drawImage uses nearest-neighbor (blocky scale-up).
 imageSmoothingEnabled: bool = true,
@@ -260,7 +270,7 @@ pub fn deinit(self: *SmCanvas) void {
     // Free any line-dash + clip-mask + filter snapshots still on the stack.
     for (self.state_stack.ptr[0..self.state_stack.len]) |frame| {
         if (frame.lineDash.len > 0) self.surface.getAllocator().free(frame.lineDash);
-        if (frame.clipMask) |m| self.surface.getAllocator().free(m);
+        if (frame.clipMask) |m| if (frame.clipOwned) self.surface.getAllocator().free(m);
         if (frame.filterVerbs.len > 0) self.surface.getAllocator().free(frame.filterVerbs);
         if (frame.filterParams.len > 0) self.surface.getAllocator().free(frame.filterParams);
     }
@@ -269,7 +279,7 @@ pub fn deinit(self: *SmCanvas) void {
     self.filter_verbs.deinit(self.surface.getAllocator());
     self.filter_params.deinit(self.surface.getAllocator());
     if (self.clip_mask) |m| {
-        self.surface.getAllocator().free(m);
+        if (self.clip_owned) self.surface.getAllocator().free(m);
         self.clip_mask = null;
     }
     if (self.scratch_pixels) |s| {
@@ -420,15 +430,17 @@ pub fn reset(self: *SmCanvas) void {
     // Drain saved frames, freeing each frame's owned snapshots.
     for (self.state_stack.ptr[0..self.state_stack.len]) |frame| {
         if (frame.lineDash.len > 0) allocator.free(frame.lineDash);
-        if (frame.clipMask) |m| allocator.free(m);
+        if (frame.clipMask) |m| if (frame.clipOwned) allocator.free(m);
         if (frame.filterVerbs.len > 0) allocator.free(frame.filterVerbs);
         if (frame.filterParams.len > 0) allocator.free(frame.filterParams);
     }
     self.state_stack.len = 0;
     if (self.clip_mask) |m| {
-        allocator.free(m);
+        if (self.clip_owned) allocator.free(m);
         self.clip_mask = null;
     }
+    self.clip_owned = true;
+    self.clip_box = .{};
     self.line_dash_storage.len = 0;
     self.filter_verbs.len = 0;
     self.filter_params.len = 0;
@@ -595,13 +607,11 @@ pub fn save(self: *SmCanvas) void {
             saved_dash = buf;
         } else |_| {}
     }
-    var saved_clip: ?[]u8 = null;
-    if (self.clip_mask) |m| {
-        if (allocator.alloc(u8, m.len)) |buf| {
-            @memcpy(buf, m);
-            saved_clip = buf;
-        } else |_| {}
-    }
+    // The clip mask is shared with the frame, which takes over its
+    // ownership; the canvas keeps a borrowed reference until the next
+    // clip() replaces it (copy-on-write — masks are never mutated).
+    const saved_clip: ?[]u8 = self.clip_mask;
+    const saved_clip_owned = self.clip_owned;
     var saved_filter_verbs: []u8 = &.{};
     if (self.filter_verbs.len > 0) {
         if (allocator.alloc(u8, self.filter_verbs.len)) |buf| {
@@ -627,6 +637,8 @@ pub fn save(self: *SmCanvas) void {
         .lineDash = saved_dash,
         .lineDashOffset = self.lineDashOffset,
         .clipMask = saved_clip,
+        .clipOwned = saved_clip_owned,
+        .clipBox = self.clip_box,
         .alpha = self.alpha,
         .blendMode = self.blendMode,
         .cxform = self.cxform,
@@ -640,10 +652,11 @@ pub fn save(self: *SmCanvas) void {
         .filterParams = saved_filter_params,
     }) catch {
         if (saved_dash.len > 0) allocator.free(saved_dash);
-        if (saved_clip) |b| allocator.free(b);
         if (saved_filter_verbs.len > 0) allocator.free(saved_filter_verbs);
         if (saved_filter_params.len > 0) allocator.free(saved_filter_params);
+        return;
     };
+    if (saved_clip != null) self.clip_owned = false;
 }
 
 /// restore() — pop the most-recent saved frame back into ctx state. No-op
@@ -667,9 +680,12 @@ pub fn restore(self: *SmCanvas) void {
         self.line_dash_storage.appendSlice(allocator, frame.lineDash) catch {};
         allocator.free(frame.lineDash);
     }
-    // Swap the saved clip mask back in; free the previously-active mask.
-    if (self.clip_mask) |m| allocator.free(m);
+    // Take the frame's clip mask back (with its ownership); free the
+    // active one only if this canvas owns it.
+    if (self.clip_mask) |m| if (self.clip_owned) allocator.free(m);
     self.clip_mask = frame.clipMask;
+    self.clip_owned = frame.clipOwned;
+    self.clip_box = frame.clipBox;
     self.alpha = frame.alpha;
     self.blendMode = frame.blendMode;
     self.cxform = frame.cxform;
@@ -806,13 +822,11 @@ inline fn endCompositeLayer(self: *SmCanvas, layer: ?CompositeLayer) void {
     // background; composite it onto the real canvas using the user's mode.
     // MASKED: these modes write every pixel, so an active clip has to be
     // honoured here or it does not reach them at all.
-    SmBlitter.blitFullMasked(
-        l.real_pixels,
-        self.pixels,
-        l.real_blend,
-        self.surface.color_type,
-        self.clip_mask,
-    );
+    if (self.clipRef()) |c| {
+        SmBlitter.blitFullMaskedClip(l.real_pixels, self.pixels, l.real_blend, self.surface.color_type, c, self.surface.width);
+    } else {
+        SmBlitter.blitFullMasked(l.real_pixels, self.pixels, l.real_blend, self.surface.color_type, null);
+    }
     self.pixels = l.real_pixels;
     self.blendMode = l.real_blend;
 }
@@ -953,7 +967,7 @@ inline fn endShadowLayer(self: *SmCanvas, layer: ?ShadowLayer) void {
             span_n,
             cov_row,
             &paint,
-            if (self.clip_mask) |cm| cm else null,
+            self.clipRef(),
         );
     }
 
@@ -1430,7 +1444,7 @@ pub fn drawRect(self: *SmCanvas, x: f64, y: f64, w: f64, h: f64, paint: *const S
         var fp = paint.*;
         fp.style = .fill;
         const aa = self.ensureAaScratch() orelse return;
-        const clip_mask: ?[]const u8 = if (self.clip_mask) |m| m else null;
+        const clip_ref = self.clipRef();
         const verts = [_][2]f64{
             .{ tl[0], tl[1] }, .{ tr[0], tr[1] },
             .{ br[0], br[1] }, .{ bl[0], bl[1] },
@@ -1441,7 +1455,7 @@ pub fn drawRect(self: *SmCanvas, x: f64, y: f64, w: f64, h: f64, paint: *const S
             self.surface.width,
             self.surface.height,
             &verts,
-            clip_mask,
+            clip_ref,
             &fp,
             aa.accum,
             aa.cov,
@@ -1469,7 +1483,7 @@ pub fn drawRect(self: *SmCanvas, x: f64, y: f64, w: f64, h: f64, paint: *const S
         var sp = paint.*;
         sp.style = .fill;
         const aa = self.ensureAaScratch() orelse return;
-        const clip_mask: ?[]const u8 = if (self.clip_mask) |m| m else null;
+        const clip_ref = self.clipRef();
         SmScan.strokePath(
             allocator,
             self.pixels,
@@ -1482,7 +1496,7 @@ pub fn drawRect(self: *SmCanvas, x: f64, y: f64, w: f64, h: f64, paint: *const S
             self.miterLimit,
             self.line_dash_storage.ptr[0..self.line_dash_storage.len],
             self.lineDashOffset,
-            clip_mask,
+            clip_ref,
             &sp,
             aa.accum,
             aa.cov,
@@ -1528,7 +1542,7 @@ fn drawTriangleNoTransform(
     paint: *const SmPaint,
 ) void {
     const aa = self.ensureAaScratch() orelse return;
-    const clip_mask: ?[]const u8 = if (self.clip_mask) |m| m else null;
+    const clip_ref = self.clipRef();
     const verts = [_][2]f64{ .{ x0, y0 }, .{ x1, y1 }, .{ x2, y2 } };
     SmScan.fillPolygonF(
         self.surface.getAllocator(),
@@ -1536,7 +1550,7 @@ fn drawTriangleNoTransform(
         self.surface.width,
         self.surface.height,
         &verts,
-        clip_mask,
+        clip_ref,
         paint,
         aa.accum,
         aa.cov,
@@ -1614,17 +1628,17 @@ fn fillRectSpan(
             @as(i32, @intFromFloat(@round(h))),
         ) orelse return;
         const n: u32 = @intCast(r.x1 - r.x0);
-        const clip_mask: ?[]const u8 = if (self.clip_mask) |m| m else null;
+        const clip_ref = self.clipRef();
         var y_cur: i32 = r.y0;
         while (y_cur < r.y1) : (y_cur += 1) {
-            SmBlitter.blitRow(self.pixels, self.surface.width, r.x0, y_cur, n, null, paint, clip_mask);
+            SmBlitter.blitRow(self.pixels, self.surface.width, r.x0, y_cur, n, null, paint, clip_ref);
         }
         return;
     }
     // Fractional coords — AA path.
     if (w <= 0 or h <= 0) return;
     const aa = self.ensureAaScratch() orelse return;
-    const clip_mask: ?[]const u8 = if (self.clip_mask) |m| m else null;
+    const clip_ref = self.clipRef();
     const verts = [_][2]f64{
         .{ x, y },
         .{ x + w, y },
@@ -1637,7 +1651,7 @@ fn fillRectSpan(
         self.surface.width,
         self.surface.height,
         &verts,
-        clip_mask,
+        clip_ref,
         paint,
         aa.accum,
         aa.cov,
@@ -1660,7 +1674,7 @@ pub fn fill(self: *SmCanvas, fill_rule: SmScan.FillRule) void {
     const layer = self.beginCompositeLayer();
     defer self.endCompositeLayer(layer);
     var paint = self.paintForFill();
-    const clip_mask: ?[]const u8 = if (self.clip_mask) |m| m else null;
+    const clip_ref = self.clipRef();
     const aa = self.ensureAaScratch() orelse return;
     SmScan.fillPath(
         self.surface.getAllocator(),
@@ -1669,7 +1683,7 @@ pub fn fill(self: *SmCanvas, fill_rule: SmScan.FillRule) void {
         self.surface.height,
         &self.path,
         fill_rule,
-        clip_mask,
+        clip_ref,
         &paint,
         aa.accum,
         aa.cov,
@@ -1696,7 +1710,7 @@ pub fn fillPathExternal(self: *SmCanvas, path: *const SmPath, fill_rule: SmScan.
     const layer = self.beginCompositeLayer();
     defer self.endCompositeLayer(layer);
     var paint = self.paintForFill();
-    const clip_mask: ?[]const u8 = if (self.clip_mask) |m| m else null;
+    const clip_ref = self.clipRef();
     const aa = self.ensureAaScratch() orelse return;
     SmScan.fillPath(
         allocator,
@@ -1705,7 +1719,7 @@ pub fn fillPathExternal(self: *SmCanvas, path: *const SmPath, fill_rule: SmScan.
         self.surface.height,
         &transformed,
         fill_rule,
-        clip_mask,
+        clip_ref,
         &paint,
         aa.accum,
         aa.cov,
@@ -1743,7 +1757,7 @@ fn strokeInternal(self: *SmCanvas, path: *const SmPath) void {
     // and fills it through the same scan pipeline as fillPath).
     var paint = paintFromShader(self.strokeStyle, .fill, 0, self.alpha, self.blendMode, self.cxform, self.surface.color_type);
     paint.antialias = self.antialias;
-    const clip_mask: ?[]const u8 = if (self.clip_mask) |m| m else null;
+    const clip_ref = self.clipRef();
     const aa = self.ensureAaScratch() orelse return;
     SmScan.strokePath(
         self.surface.getAllocator(),
@@ -1757,7 +1771,7 @@ fn strokeInternal(self: *SmCanvas, path: *const SmPath) void {
         self.miterLimit,
         self.line_dash_storage.ptr[0..self.line_dash_storage.len],
         self.lineDashOffset,
-        clip_mask,
+        clip_ref,
         &paint,
         aa.accum,
         aa.cov,
@@ -1783,40 +1797,91 @@ pub fn clipPath(self: *SmCanvas, path: *const SmPath, fill_rule: SmScan.FillRule
     self.clipInternal(&transformed, fill_rule);
 }
 
+/// The active clip as the blitter sees it: mask plus box.
+pub fn clipRef(self: *const SmCanvas) ?SmBlitter.Clip {
+    const m = self.clip_mask orelse return null;
+    return .{ .mask = m, .x0 = self.clip_box.x0, .y0 = self.clip_box.y0, .x1 = self.clip_box.x1, .y1 = self.clip_box.y1 };
+}
+
+/// A path that is one axis-aligned rectangle on integer coordinates,
+/// clamped to the canvas — the shape of every scrollRect, mask bound
+/// and layer bound a Flash stage clips to. Empty rectangles are empty
+/// boxes (a clip to nothing).
+fn integerRect(self: *const SmCanvas, path: *const SmPath) ?SmScan.RowBox {
+    if (path.verbs.len != 1 or path.verbs.ptr[0] != @intFromEnum(SmPath.Opcode.rect_path)) return null;
+    if (path.points.len < 4) return null;
+    const x = path.points.ptr[0];
+    const y = path.points.ptr[1];
+    const w = path.points.ptr[2];
+    const h = path.points.ptr[3];
+    inline for (.{ x, y, w, h }) |v| {
+        if (!std.math.isFinite(v) or @floor(v) != v or @abs(v) > 1.0e7) return null;
+    }
+    if (w <= 0 or h <= 0) return .{};
+    const cw: i32 = @intCast(self.surface.width);
+    const ch: i32 = @intCast(self.surface.height);
+    const r: SmScan.RowBox = .{
+        .x0 = @max(0, @as(i32, @intFromFloat(x))),
+        .y0 = @max(0, @as(i32, @intFromFloat(y))),
+        .x1 = @min(cw, @as(i32, @intFromFloat(x + w))),
+        .y1 = @min(ch, @as(i32, @intFromFloat(y + h))),
+    };
+    return if (r.isEmpty()) .{} else r;
+}
+
 fn clipInternal(self: *SmCanvas, path: *const SmPath, fill_rule: SmScan.FillRule) void {
     if (path.verbs.len == 0) return;
     const allocator = self.surface.getAllocator();
-    const total: usize = @as(usize, self.surface.width) * @as(usize, self.surface.height);
+    const w: usize = self.surface.width;
+    const total: usize = w * @as(usize, self.surface.height);
     if (total == 0) return;
-    // Rasterize the new clip path into a fresh zeroed buffer.
+    // Rasterize the new clip path into a fresh zeroed buffer — or, for
+    // an integer rectangle, write its rows directly (no sweep).
     const new_mask = allocator.alloc(u8, total) catch return;
     @memset(new_mask, 0);
-    SmScan.fillPathToCoverage(
-        allocator,
-        new_mask,
-        self.surface.width,
-        self.surface.height,
-        path,
-        fill_rule,
-        self.antialias,
-    ) catch {
-        allocator.free(new_mask);
-        return;
-    };
-    if (self.clip_mask) |existing| {
-        // Intersect multiplicatively: `(a * b + 127) / 255`. For prior
-        // binary masks (legacy save/restore frames or pre-AA-clip data)
-        // this still returns 0/0xFF correctly. AA clip boundaries combine
-        // with AA shape coverage downstream via the same formula in
-        // `SmBlitter.blitRow`.
-        for (0..total) |i| {
-            const a: u16 = @intCast(new_mask[i]);
-            const b: u16 = @intCast(existing[i]);
-            new_mask[i] = @intCast((a * b + 127) / 255);
+    var box: SmScan.RowBox = .{};
+    if (self.integerRect(path)) |r| {
+        box = r;
+        var y = r.y0;
+        while (y < r.y1) : (y += 1) {
+            const off = @as(usize, @intCast(y)) * w;
+            @memset(new_mask[off + @as(usize, @intCast(r.x0)) .. off + @as(usize, @intCast(r.x1))], 0xFF);
         }
-        allocator.free(existing);
+    } else {
+        SmScan.fillPathToCoverageBox(
+            allocator,
+            new_mask,
+            self.surface.width,
+            self.surface.height,
+            path,
+            fill_rule,
+            self.antialias,
+            .analytic,
+            &box,
+        ) catch {
+            allocator.free(new_mask);
+            return;
+        };
+    }
+    if (self.clip_mask) |existing| {
+        // Intersect multiplicatively (`(a * b + 127) / 255`, the formula
+        // `SmBlitter.blitRow` composes coverage with), but only inside
+        // the new mask's box: outside it the new mask is already zero,
+        // and inside it the old mask is zero outside ITS box, so the
+        // product's box is the intersection.
+        var y = box.y0;
+        while (y < box.y1) : (y += 1) {
+            const off = @as(usize, @intCast(y)) * w;
+            const lo = off + @as(usize, @intCast(box.x0));
+            const hi = off + @as(usize, @intCast(box.x1));
+            simd.clipCombineU8(new_mask[lo..hi], new_mask[lo..hi], existing[lo..hi]);
+        }
+        box = box.intersect(self.clip_box);
+        if (self.clip_owned) allocator.free(existing);
     }
     self.clip_mask = new_mask;
+    self.clip_owned = true;
+    self.clip_box = box;
 }
 
 // --- HTML5-shaped sugar (build a SmPaint from current ctx state) ---------
@@ -1907,7 +1972,7 @@ pub fn strokeTriangle(
     var paint = paintFromShader(self.strokeStyle, .fill, 0, self.alpha, self.blendMode, self.cxform, self.surface.color_type);
     paint.antialias = self.antialias;
     const aa = self.ensureAaScratch() orelse return;
-    const clip_mask: ?[]const u8 = if (self.clip_mask) |m| m else null;
+    const clip_ref = self.clipRef();
     SmScan.strokePath(
         allocator,
         self.pixels,
@@ -1920,7 +1985,7 @@ pub fn strokeTriangle(
         self.miterLimit,
         self.line_dash_storage.ptr[0..self.line_dash_storage.len],
         self.lineDashOffset,
-        clip_mask,
+        clip_ref,
         &paint,
         aa.accum,
         aa.cov,
@@ -2127,6 +2192,8 @@ pub fn drawImageScaledSub(
 
     var py: i32 = dst_y0_i;
     while (py < dst_y1_i) : (py += 1) {
+        // Rows outside the clip's box are not even sampled.
+        if (clip_mask != null and (py < self.clip_box.y0 or py >= self.clip_box.y1)) continue;
         const row_off: usize =
             @as(usize, @intCast(py)) * @as(usize, self.surface.width) +
             @as(usize, @intCast(dst_x0_i));
@@ -2463,7 +2530,7 @@ pub fn drawTextRun(
                 span_n,
                 cov_slice,
                 paint,
-                if (self.clip_mask) |cm| cm else null,
+                self.clipRef(),
             );
         }
     }
@@ -2508,4 +2575,93 @@ pub fn fillTextWithSpacing(
         word_spacing_px,
         kerning_on,
     );
+}
+
+// --- Clip tests (run through tests_libc.zig: the canvas links stb) ------
+
+test "clip: an integer rectangle takes the fast path and equals the swept mask, box included" {
+    const ta = std.testing.allocator;
+    var surface = try SmSurface.init(ta, 40, 30);
+    defer surface.deinit();
+    var c = SmCanvas.initFromSurface(&surface);
+    defer c.deinit();
+    c.beginPath();
+    c.rect(5, 7, 12, 9);
+    c.clip(.nonzero);
+    try std.testing.expect(c.clip_mask != null);
+    try std.testing.expectEqual(SmScan.RowBox{ .x0 = 5, .y0 = 7, .x1 = 17, .y1 = 16 }, c.clip_box);
+
+    var path = SmPath.emptyWithAllocator(ta);
+    defer path.deinit();
+    path.rect(5, 7, 12, 9);
+    const mask = try ta.alloc(u8, 40 * 30);
+    defer ta.free(mask);
+    @memset(mask, 0);
+    var box: SmScan.RowBox = .{};
+    try SmScan.fillPathToCoverageBox(ta, mask, 40, 30, &path, .nonzero, true, .analytic, &box);
+    try std.testing.expectEqualSlices(u8, mask, c.clip_mask.?);
+    try std.testing.expectEqual(c.clip_box, box);
+
+    // A fractional rectangle takes the sweep and has partial edge bytes.
+    c.beginPath();
+    c.rect(5.5, 7, 12, 9);
+    c.clip(.nonzero);
+    const m = c.clip_mask.?;
+    try std.testing.expect(m[8 * 40 + 5] > 0 and m[8 * 40 + 5] < 255);
+    try std.testing.expectEqual(SmScan.RowBox{ .x0 = 5, .y0 = 7, .x1 = 17, .y1 = 16 }, c.clip_box);
+}
+
+test "clip: save shares the mask, a clip under save leaves the shared one alone, restore frees only what it owns" {
+    const ta = std.testing.allocator;
+    var surface = try SmSurface.init(ta, 32, 32);
+    defer surface.deinit();
+    var c = SmCanvas.initFromSurface(&surface);
+    defer c.deinit();
+    c.beginPath();
+    c.rect(0, 0, 20, 20);
+    c.clip(.nonzero);
+    const m0 = c.clip_mask.?.ptr;
+    try std.testing.expect(c.clip_owned);
+
+    c.save();
+    try std.testing.expect(!c.clip_owned);
+    try std.testing.expect(c.clip_mask.?.ptr == m0);
+    c.save();
+    try std.testing.expect(!c.clip_owned);
+
+    c.beginPath();
+    c.rect(10, 10, 20, 20);
+    c.clip(.nonzero);
+    try std.testing.expect(c.clip_owned);
+    try std.testing.expect(c.clip_mask.?.ptr != m0);
+    try std.testing.expectEqual(SmScan.RowBox{ .x0 = 10, .y0 = 10, .x1 = 20, .y1 = 20 }, c.clip_box);
+    try std.testing.expectEqual(@as(u8, 255), c.clip_mask.?[15 * 32 + 15]);
+    try std.testing.expectEqual(@as(u8, 0), c.clip_mask.?[25 * 32 + 25]);
+    try std.testing.expectEqual(@as(u8, 0), c.clip_mask.?[5 * 32 + 5]);
+
+    c.restore();
+    try std.testing.expect(c.clip_mask.?.ptr == m0);
+    try std.testing.expect(!c.clip_owned);
+    c.restore();
+    try std.testing.expect(c.clip_mask.?.ptr == m0);
+    try std.testing.expect(c.clip_owned);
+    try std.testing.expectEqual(SmScan.RowBox{ .x0 = 0, .y0 = 0, .x1 = 20, .y1 = 20 }, c.clip_box);
+    // deinit frees m0 exactly once (the testing allocator reports leaks
+    // and double frees).
+}
+
+test "clip: an empty rectangle clips everything; fills under it touch no pixel" {
+    const ta = std.testing.allocator;
+    var surface = try SmSurface.init(ta, 16, 16);
+    defer surface.deinit();
+    var c = SmCanvas.initFromSurface(&surface);
+    defer c.deinit();
+    c.beginPath();
+    c.rect(0, 0, 0, 0);
+    c.clip(.nonzero);
+    try std.testing.expect(c.clip_box.isEmpty());
+    c.beginPath();
+    c.rect(0, 0, 16, 16);
+    c.fill(.nonzero);
+    for (c.pixels) |p| try std.testing.expectEqual(@as(u32, 0), p);
 }

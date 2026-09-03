@@ -432,7 +432,7 @@ pub fn fillPath(
     canvas_h: u32,
     path: *const SmPath,
     fill_rule: FillRule,
-    clip_mask: ?[]const u8,
+    clip: ?SmBlitter.Clip,
     paint: *const SmPaint,
     aa_accum: []f32,
     cov_row: []u8,
@@ -443,7 +443,7 @@ pub fn fillPath(
     var edges: EdgeBuf = .{};
     defer edges.deinit(allocator);
     try flattenPathToFillEdges(allocator, path, &edges);
-    try sweepFill(&edges, allocator, pixels, canvas_w, canvas_h, fill_rule, clip_mask, paint, aa_accum, cov_row);
+    try sweepFill(&edges, allocator, pixels, canvas_w, canvas_h, fill_rule, clip, paint, aa_accum, cov_row);
 }
 
 /// Pick the converter: the analytic one for antialiased fills unless the
@@ -457,7 +457,7 @@ fn sweepFill(
     canvas_w: u32,
     canvas_h: u32,
     fill_rule: FillRule,
-    clip_mask: ?[]const u8,
+    clip: ?SmBlitter.Clip,
     paint: *const SmPaint,
     aa_accum: []f32,
     cov_row: []u8,
@@ -466,14 +466,16 @@ fn sweepFill(
         const emit = struct {
             pixels: []u32,
             paint: *const SmPaint,
-            clip_mask: ?[]const u8,
+            clip: ?SmBlitter.Clip,
             fn run(self: @This(), canvas_w_: u32, x: i32, y: i32, cov: []const u8) void {
-                SmBlitter.blitRow(self.pixels, canvas_w_, x, y, @intCast(cov.len), cov, self.paint, self.clip_mask);
+                SmBlitter.blitRow(self.pixels, canvas_w_, x, y, @intCast(cov.len), cov, self.paint, self.clip);
             }
-        }{ .pixels = pixels, .paint = paint, .clip_mask = clip_mask };
-        try sweepAnalytic(edges, allocator, canvas_w, canvas_h, fill_rule, aa_accum, cov_row, emit);
+        }{ .pixels = pixels, .paint = paint, .clip = clip };
+        // Rows outside the clip's box are never deposited, let alone blitted.
+        const y_clip: ?[2]i32 = if (clip) |c| .{ c.y0, c.y1 } else null;
+        try sweepAnalytic(edges, allocator, canvas_w, canvas_h, fill_rule, aa_accum, cov_row, emit, y_clip);
     } else {
-        try sweepEdges(edges, allocator, pixels, canvas_w, canvas_h, fill_rule, clip_mask, paint, aa_accum, cov_row);
+        try sweepEdges(edges, allocator, pixels, canvas_w, canvas_h, fill_rule, clip, paint, aa_accum, cov_row);
     }
 }
 
@@ -490,7 +492,7 @@ pub fn fillPolygonF(
     canvas_w: u32,
     canvas_h: u32,
     vertices: []const [2]f64,
-    clip_mask: ?[]const u8,
+    clip: ?SmBlitter.Clip,
     paint: *const SmPaint,
     aa_accum: []f32,
     cov_row: []u8,
@@ -518,7 +520,7 @@ pub fn fillPolygonF(
         canvas_w,
         canvas_h,
         .evenodd,
-        clip_mask,
+        clip,
         paint,
         aa_accum,
         cov_row,
@@ -565,6 +567,53 @@ pub fn fillPathToCoverageMode(
     antialias: bool,
     aa_mode: SmPaint.AaMode,
 ) !void {
+    var box: RowBox = .{};
+    return fillPathToCoverageBox(allocator, mask, canvas_w, canvas_h, path, fill_rule, antialias, aa_mode, &box);
+}
+
+/// The half-open bounding box of the rows and columns a coverage sweep
+/// wrote non-zero bytes to; empty when x0 >= x1.
+pub const RowBox = struct {
+    x0: i32 = 0,
+    y0: i32 = 0,
+    x1: i32 = 0,
+    y1: i32 = 0,
+
+    pub inline fn isEmpty(self: RowBox) bool {
+        return self.x0 >= self.x1 or self.y0 >= self.y1;
+    }
+
+    pub fn addRun(self: *RowBox, x: i32, y: i32, n: usize) void {
+        const x_end = x + @as(i32, @intCast(n));
+        if (self.isEmpty()) {
+            self.* = .{ .x0 = x, .y0 = y, .x1 = x_end, .y1 = y + 1 };
+            return;
+        }
+        self.x0 = @min(self.x0, x);
+        self.x1 = @max(self.x1, x_end);
+        self.y0 = @min(self.y0, y);
+        self.y1 = @max(self.y1, y + 1);
+    }
+
+    pub fn intersect(self: RowBox, other: RowBox) RowBox {
+        const r: RowBox = .{ .x0 = @max(self.x0, other.x0), .y0 = @max(self.y0, other.y0), .x1 = @min(self.x1, other.x1), .y1 = @min(self.y1, other.y1) };
+        return if (r.isEmpty()) .{} else r;
+    }
+};
+
+/// `fillPathToCoverageMode` that also reports the box of what it wrote.
+pub fn fillPathToCoverageBox(
+    allocator: std.mem.Allocator,
+    mask: []u8,
+    canvas_w: u32,
+    canvas_h: u32,
+    path: *const SmPath,
+    fill_rule: FillRule,
+    antialias: bool,
+    aa_mode: SmPaint.AaMode,
+    box: *RowBox,
+) !void {
+    box.* = .{};
     if (path.verbs.len == 0) return;
     if (canvas_w == 0 or canvas_h == 0) return;
 
@@ -580,12 +629,14 @@ pub fn fillPathToCoverageMode(
     if (antialias and aa_mode == .analytic) {
         const emit = struct {
             mask: []u8,
+            box: *RowBox,
             fn run(self: @This(), canvas_w_: u32, x: i32, y: i32, cov: []const u8) void {
                 const off = @as(usize, @intCast(y)) * @as(usize, canvas_w_) + @as(usize, @intCast(x));
                 @memcpy(self.mask[off .. off + cov.len], cov);
+                self.box.addRun(x, y, cov.len);
             }
-        }{ .mask = mask };
-        try sweepAnalytic(&edges, allocator, canvas_w, canvas_h, fill_rule, aa_accum, cov_row, emit);
+        }{ .mask = mask, .box = box };
+        try sweepAnalytic(&edges, allocator, canvas_w, canvas_h, fill_rule, aa_accum, cov_row, emit, null);
         return;
     }
     try sweepEdgesToCoverageMask(
@@ -598,6 +649,7 @@ pub fn fillPathToCoverageMode(
         aa_accum,
         cov_row,
         antialias,
+        box,
     );
 }
 
@@ -683,7 +735,7 @@ fn sweepEdges(
     canvas_w: u32,
     canvas_h: u32,
     fill_rule: FillRule,
-    clip_mask: ?[]const u8,
+    clip: ?SmBlitter.Clip,
     paint: *const SmPaint,
     aa_accum: []f32,
     cov_row: []u8,
@@ -824,7 +876,7 @@ fn sweepEdges(
                 n,
                 cov_row[@intCast(run_start)..@intCast(x)],
                 paint,
-                clip_mask,
+                clip,
             );
         }
         // 6. Clear only what this row touched: every deposit lands inside
@@ -948,6 +1000,7 @@ fn sweepAnalytic(
     aa_accum: []f32,
     cov_row: []u8,
     emit: anytype,
+    y_clip: ?[2]i32,
 ) !void {
     if (edges_in.len == 0) return;
     if (aa_accum.len < canvas_w + accum_slack or cov_row.len < canvas_w) return;
@@ -966,8 +1019,14 @@ fn sweepAnalytic(
     }
     const ch_i: i32 = @intCast(canvas_h);
     const cw_i: i32 = @intCast(canvas_w);
-    const y_start: i32 = @max(0, @as(i32, @intFromFloat(@floor(y_min_total))));
-    const y_end: i32 = @min(ch_i, @as(i32, @intFromFloat(@ceil(y_max_total))));
+    var y_start: i32 = @max(0, @as(i32, @intFromFloat(@floor(y_min_total))));
+    var y_end: i32 = @min(ch_i, @as(i32, @intFromFloat(@ceil(y_max_total))));
+    if (y_clip) |yc| {
+        // Edges that end above y_start are admitted and deposit nothing
+        // (their row segment is empty), so clamping is safe.
+        y_start = @max(y_start, yc[0]);
+        y_end = @min(y_end, yc[1]);
+    }
     if (y_start >= y_end) return;
 
     const acc = aa_accum[0 .. canvas_w + accum_slack];
@@ -1076,6 +1135,7 @@ fn sweepEdgesToCoverageMask(
     aa_accum: []f32,
     cov_row: []u8,
     antialias: bool,
+    box: *RowBox,
 ) !void {
     if (edges.len == 0) return;
     if (aa_accum.len < canvas_w or cov_row.len < canvas_w) return;
@@ -1173,6 +1233,7 @@ fn sweepEdgesToCoverageMask(
 
         // 4. Quantize accumulator → mask row.
         if (row_x_min >= row_x_max) continue;
+        box.addRun(row_x_min, y_int, @intCast(row_x_max - row_x_min));
         const row_off: usize = @as(usize, @intCast(y_int)) * @as(usize, canvas_w);
         var x: i32 = row_x_min;
         while (x < row_x_max) : (x += 1) {
@@ -1844,7 +1905,7 @@ pub fn strokePath(
     miter_limit: f64,
     line_dash: []const f64,
     line_dash_offset: f64,
-    clip_mask: ?[]const u8,
+    clip: ?SmBlitter.Clip,
     paint: *const SmPaint,
     aa_accum: []f32,
     cov_row: []u8,
@@ -1868,7 +1929,7 @@ pub fn strokePath(
     // Stroke outline polygon is filled with the standard non-zero winding
     // rule (the donut is built CCW outer + CW inner) — fill rule is not
     // user-controllable for strokes.
-    try sweepFill(&edges, allocator, pixels, canvas_w, canvas_h, .nonzero, clip_mask, paint, aa_accum, cov_row);
+    try sweepFill(&edges, allocator, pixels, canvas_w, canvas_h, .nonzero, clip, paint, aa_accum, cov_row);
 }
 
 // ---------------------------------------------------------------------------

@@ -1066,3 +1066,50 @@ test "a run trimmed by a clip box samples as if untrimmed: gradient and pattern 
         try std.testing.expectEqualSlices(u32, backdrop[30..], boxed[30..]);
     }
 }
+
+test "clip inner box: a mask with a hole never claims the hole" {
+    const a = std.testing.allocator;
+    const SmScan = @import("SmScan.zig");
+    const SmPath = @import("SmPath.zig");
+    const W: u32 = 64;
+    const H: u32 = 64;
+    const mask = try a.alloc(u8, W * H);
+    defer a.free(mask);
+    @memset(mask, 0);
+    var path = SmPath.emptyWithAllocator(a);
+    defer path.deinit();
+    // A ring: an outer rectangle with an inner one wound the other way.
+    path.rect(4.5, 4.5, 50.2, 50.2);
+    path.moveTo(20.3, 20.3);
+    path.lineTo(20.3, 40.3);
+    path.lineTo(40.3, 40.3);
+    path.lineTo(40.3, 20.3);
+    path.closePath();
+    var box: SmScan.RowBox = .{};
+    try SmScan.fillPathToCoverageBox(a, mask, W, H, &path, .nonzero, true, .analytic, &box);
+    const inner = SmScan.innerBox(mask, W, box);
+    var y: i32 = 0;
+    while (y < @as(i32, H)) : (y += 1) {
+        var x: i32 = 0;
+        while (x < @as(i32, W)) : (x += 1) {
+            const inside = x >= inner.x0 and x < inner.x1 and y >= inner.y0 and y < inner.y1;
+            if (inside) try std.testing.expectEqual(@as(u8, 255), mask[@as(usize, @intCast(y)) * W + @as(usize, @intCast(x))]);
+        }
+    }
+    // Blits with and without the shortcut agree everywhere.
+    const with: Clip = .{ .mask = mask, .x0 = box.x0, .y0 = box.y0, .x1 = box.x1, .y1 = box.y1, .ix0 = inner.x0, .iy0 = inner.y0, .ix1 = inner.x1, .iy1 = inner.y1 };
+    const without: Clip = .{ .mask = mask, .x0 = box.x0, .y0 = box.y0, .x1 = box.x1, .y1 = box.y1 };
+    const pa = try a.alloc(u32, W * H);
+    defer a.free(pa);
+    const pb = try a.alloc(u32, W * H);
+    defer a.free(pb);
+    @memset(pa, 0xFF808080);
+    @memset(pb, 0xFF808080);
+    const paint: SmPaint = .{ .shader = .{ .solid = 0xFF2040A0 }, .style = .fill, .blend_mode = .src_over };
+    var yy: i32 = 0;
+    while (yy < @as(i32, H)) : (yy += 1) {
+        blitRow(pa, W, 0, yy, W, null, &paint, with);
+        blitRow(pb, W, 0, yy, W, null, &paint, without);
+    }
+    try std.testing.expect(std.mem.eql(u32, pa, pb));
+}

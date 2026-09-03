@@ -999,11 +999,13 @@ fn clipEdgesToWidth(edges: *const EdgeBuf, allocator: std.mem.Allocator, out: *E
 /// The analytic converter. `emit.run(canvas_w, x, y, cov)` receives every
 /// run of non-zero coverage bytes (the blitter for fills, the mask for
 /// clips). `aa_accum` must have `canvas_w + accum_slack` cells.
-/// innerBox — the largest box the caller may treat as unmasked: rows
-/// forming the longest contiguous run with a 255 cell, intersected with
-/// each of those rows' outermost 255 cells. Every byte inside is 255,
-/// so a blit there multiplies by 255 — the identity — and can skip the
-/// mask (SmBlitter.blitRow does). A rectangle mask at fractional
+/// innerBox — a box the caller may treat as unmasked: every byte inside
+/// is 255. Per row the LONGEST run of 255s is taken (not the outermost
+/// 255s — a mask with a hole has zeros between those); rows are joined
+/// into the longest contiguous block whose runs keep a non-empty
+/// intersection, and the block with the largest area wins. A blit
+/// inside multiplies by 255 — the identity — and can skip the mask
+/// (SmBlitter.blitRow does). A rectangle mask at fractional
 /// coordinates, the common Flash masker, yields its whole interior.
 pub fn innerBox(mask: []const u8, w: usize, box: RowBox) RowBox {
     var best: RowBox = .{};
@@ -1015,19 +1017,16 @@ pub fn innerBox(mask: []const u8, w: usize, box: RowBox) RowBox {
         if (y < box.y1) {
             const row = mask[@as(usize, @intCast(y)) * w ..];
             var x = box.x0;
-            while (x < box.x1) : (x += 1) {
-                if (row[@intCast(x)] == 255) {
-                    lo = x;
-                    break;
+            while (x < box.x1) {
+                if (row[@intCast(x)] != 255) {
+                    x += 1;
+                    continue;
                 }
-            }
-            if (lo >= 0) {
-                x = box.x1;
-                while (x > lo) : (x -= 1) {
-                    if (row[@intCast(x - 1)] == 255) {
-                        hi = x;
-                        break;
-                    }
+                const start = x;
+                while (x < box.x1 and row[@intCast(x)] == 255) x += 1;
+                if (x - start > hi - lo) {
+                    lo = start;
+                    hi = x;
                 }
             }
         }

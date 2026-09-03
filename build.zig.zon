@@ -1,0 +1,14 @@
+.{
+    .name = .simdra,
+    .version = "0.2.0",
+    .fingerprint = 0x978cd68eb14073e,
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{},
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "zig",
+        "LICENSE",
+        "README.md",
+    },
+}

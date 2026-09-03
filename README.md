@@ -15,6 +15,18 @@ any V8 isolate with WASM-SIMD.
 npm install simdra
 ```
 
+## Building the Zig core (2026-09)
+
+The Zig side builds and tests with **Zig 0.16 only** — `zig build test`,
+`zig build test-leak`, `zig build test-format`, `zig build bench
+-Doptimize=ReleaseFast` (see `build.zig`). The node-zigar bindings behind
+`npm test`, the JS canvas facade and the WASM bundle target node-zigar's
+pinned Zig (0.15.2) and are **parked** until node-zigar ships a 0.16
+release; until then `npm test` and `npm run bench` do not run. Rendering
+changes are gated by the Zig tests (backend tolerance, scan-converter
+goldens, canvas clip tests) and by the handyflash image ratchet and visual
+gate downstream. See Roadmap.md.
+
 ## Why
 
 [`sharp`](https://sharp.pixelplumbing.com) is great. So is

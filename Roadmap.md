@@ -4,6 +4,21 @@ Future work, ordered by what unlocks the most use cases. No dates —
 items land when somebody picks them up. Each entry names what it
 enables and what stands in the way.
 
+## Zig 0.16 and the JS path — in flight (2026-09)
+
+The Zig core moved to Zig 0.16 (`build.zig`: `test`, `test-leak`,
+`test-format`, `bench`). node-zigar is pinned to 0.15.2, so the JS facade,
+`npm test` (543 tests, the SSIM scenes) and the WASM bundle are parked
+until a node-zigar release supports 0.16. What stands in the way: that
+release. Until it lands the gates are the Zig tests plus handyflash's
+image ratchet and visual gate; the JS suite is re-run the day it builds.
+
+The same push replaces the 8×-supersampled scan converter with analytic
+coverage, vectorises the blend kernels for NEON, samples gradients from a
+256-entry ramp by default and stops allocating a page per blitted run —
+tolerances, not byte-equality, are the rule from here (±1 LSB per channel
+between backends; see `zig/simdra/opts/tolerance_test.zig`).
+
 ## Flash-renderer extensions — landed (2026-08)
 
 Four additions driven by the handyflash (SWF/AVM1) renderer, all additive

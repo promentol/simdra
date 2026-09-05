@@ -373,20 +373,43 @@ fn sortSubEdgesByX(xs: []SubEdge) void {
     }
 }
 
-/// Insertion sort the edge list by `y_min`. One-time cost after edge
-/// generation; lets the main sweep walk a `next_idx` cursor instead of
-/// re-checking every edge per scanline.
-fn sortEdgesByYMin(edges: []Edge) void {
-    // pdq: the flattener emits edges in path order, which is nowhere near
-    // sorted by y, and the old insertion sort was O(N²) on every sweep —
-    // a thousand-edge glyph paid ~250k struct moves before touching a
-    // pixel. Equal y_min order is irrelevant downstream: the sub-scanline
-    // walk re-sorts by x, and the analytic converter's deposits commute.
-    std.sort.pdq(Edge, edges, {}, struct {
-        fn lt(_: void, a: Edge, b: Edge) bool {
+/// Sort the edge list by `y_min`. One-time cost after edge generation;
+/// lets the main sweep walk a `next_idx` cursor instead of re-checking
+/// every edge per scanline.
+///
+/// pdq over the 40-byte edges moved every edge many times; it now sorts
+/// 16-byte `(y_min, index)` keys with the SAME comparator and applies
+/// the permutation once. pdq's decisions depend only on the comparison
+/// outcomes and the initial order, both unchanged, so the order — ties
+/// included — is exactly the one sorting the edges gave. That matters:
+/// the order edges enter the active list is the order the analytic
+/// converter deposits into a cell, and f64 sums do not commute.
+/// Without scratch memory the edges are sorted in place, as before.
+fn sortEdgesByYMin(allocator: std.mem.Allocator, edges: []Edge) void {
+    const Key = struct { y: f64, idx: u32 };
+    const cmp = struct {
+        fn ltEdge(_: void, a: Edge, b: Edge) bool {
             return a.y_min < b.y_min;
         }
-    }.lt);
+        fn ltKey(_: void, a: Key, b: Key) bool {
+            return a.y < b.y;
+        }
+    };
+    if (edges.len < 2) return;
+    const keys = allocator.alloc(Key, edges.len) catch {
+        std.sort.pdq(Edge, edges, {}, cmp.ltEdge);
+        return;
+    };
+    defer allocator.free(keys);
+    const tmp = allocator.alloc(Edge, edges.len) catch {
+        std.sort.pdq(Edge, edges, {}, cmp.ltEdge);
+        return;
+    };
+    defer allocator.free(tmp);
+    for (edges, 0..) |e, i| keys[i] = .{ .y = e.y_min, .idx = @intCast(i) };
+    std.sort.pdq(Key, keys, {}, cmp.ltKey);
+    for (keys, 0..) |k, i| tmp[i] = edges[k.idx];
+    @memcpy(edges, tmp);
 }
 
 /// flattenPathToFillEdges — populate `edges` with the line-segment edges
@@ -736,7 +759,7 @@ fn sweepEdges(
     // The per-sub-sample weight (exact for 1, 2 and 8: powers of two).
     const sub_weight: f32 = 1.0 / @as(f32, @floatFromInt(sub_count));
 
-    sortEdgesByYMin(edges.ptr[0..edges.len]);
+    sortEdgesByYMin(allocator, edges.ptr[0..edges.len]);
 
     var y_min_total: f64 = std.math.inf(f64);
     var y_max_total: f64 = -std.math.inf(f64);
@@ -757,10 +780,14 @@ fn sweepEdges(
     // — 4·W bytes per scanline for shapes that touch a dozen pixels.
     @memset(aa_accum[0..canvas_w], 0.0);
 
+    // Neither list ever holds more than every edge: reserved once, every
+    // append below is a store.
     var active: ActiveBuf = .{};
     defer active.deinit(allocator);
+    try active.ensureUnusedCapacity(allocator, edges.len);
     var sub_list: SubEdgeBuf = .{};
     defer sub_list.deinit(allocator);
+    try sub_list.ensureUnusedCapacity(allocator, edges.len);
     var next_idx: usize = 0;
 
     var y_int: i32 = y_start;
@@ -1072,7 +1099,7 @@ fn sweepAnalytic(
     defer edges.deinit(allocator);
     try clipEdgesToWidth(edges_in, allocator, &edges, @floatFromInt(canvas_w));
     if (edges.len == 0) return;
-    sortEdgesByYMin(edges.ptr[0..edges.len]);
+    sortEdgesByYMin(allocator, edges.ptr[0..edges.len]);
 
     var y_min_total: f64 = std.math.inf(f64);
     var y_max_total: f64 = -std.math.inf(f64);
@@ -1101,10 +1128,14 @@ fn sweepAnalytic(
     errdefer @memset(acc, 0.0);
     const w_f: f64 = @floatFromInt(canvas_w);
 
+    // Neither list ever holds more than every edge: reserved once, every
+    // append below is a store.
     var active: ActiveBuf = .{};
     defer active.deinit(allocator);
+    try active.ensureUnusedCapacity(allocator, edges.len);
     var ivs: IvBuf = .{};
     defer ivs.deinit(allocator);
+    try ivs.ensureUnusedCapacity(allocator, edges.len);
     var next_idx: usize = 0;
 
     var y_int: i32 = y_start;
@@ -2312,6 +2343,37 @@ test "MEDIUM spans replay the direct two-sub-scanline fill byte for byte: 32 see
         }
     }
     try std.testing.expectEqual(@as(usize, 0), mismatched);
+}
+
+test "sorting edges by key gives pdq's order over the structs, ties included" {
+    // 1000 lists with y_min drawn from a handful of values, so ties are
+    // everywhere; the key sort must place every edge where sorting the
+    // structs with the same comparator would.
+    const a = std.testing.allocator;
+    var prng = std.Random.DefaultPrng.init(0x5eed_5047);
+    const r = prng.random();
+    var round: usize = 0;
+    while (round < 1000) : (round += 1) {
+        const n = 2 + r.uintLessThan(usize, 200);
+        const by_key = try a.alloc(Edge, n);
+        defer a.free(by_key);
+        const by_struct = try a.alloc(Edge, n);
+        defer a.free(by_struct);
+        for (by_key, 0..) |*e, i| {
+            e.* = .{ .y_min = @floatFromInt(r.uintLessThan(u32, 7)), .y_max = 100, .x_at_y_min = @floatFromInt(i), .inv_slope = 0, .direction = 1 };
+        }
+        @memcpy(by_struct, by_key);
+        sortEdgesByYMin(a, by_key);
+        std.sort.pdq(Edge, by_struct, {}, struct {
+            fn lt(_: void, x: Edge, y: Edge) bool {
+                return x.y_min < y.y_min;
+            }
+        }.lt);
+        for (by_key, by_struct) |k, st| {
+            try std.testing.expectEqual(st.y_min, k.y_min);
+            try std.testing.expectEqual(st.x_at_y_min, k.x_at_y_min);
+        }
+    }
 }
 
 test "a clip mask is the fill's coverage, byte for byte, at every quality" {

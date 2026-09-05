@@ -59,7 +59,14 @@ pub fn SmList(comptime T: type) type {
             self.cap = new_cap;
         }
 
-        pub fn append(self: *Self, allocator: std.mem.Allocator, value: T) !void {
+        pub inline fn append(self: *Self, allocator: std.mem.Allocator, value: T) !void {
+            // The sweeps append tens of thousands of entries a frame into
+            // lists that were reserved once: the common case is a store.
+            if (self.len < self.cap) {
+                self.ptr[self.len] = value;
+                self.len += 1;
+                return;
+            }
             try self.ensureUnusedCapacity(allocator, 1);
             self.ptr[self.len] = value;
             self.len += 1;

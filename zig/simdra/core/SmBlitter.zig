@@ -1086,7 +1086,7 @@ test "clip inner box: a mask with a hole never claims the hole" {
     path.lineTo(40.3, 20.3);
     path.closePath();
     var box: SmScan.RowBox = .{};
-    try SmScan.fillPathToCoverageBox(a, mask, W, H, &path, .nonzero, true, .analytic, &box);
+    try SmScan.fillPathToCoverageBox(a, mask, W, H, &path, .nonzero, .high, &box);
     const inner = SmScan.innerBox(mask, W, box);
     var y: i32 = 0;
     while (y < @as(i32, H)) : (y += 1) {

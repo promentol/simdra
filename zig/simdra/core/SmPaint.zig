@@ -115,9 +115,16 @@ pub const LineJoin = enum(u8) {
 ///     `hard_light`, `soft_light`, `difference`, `exclusion`.
 ///   • Non-separable blend (HSL-shape color manipulation): `hue`,
 ///     `saturation`, `color`, `luminosity`.
-pub const AaMode = enum(u8) {
-    analytic = 0,
-    supersample8 = 1,
+/// Flash's stage quality, as the rasterizer sees it. `high` is the
+/// analytic signed-area converter with every sampler exact; `medium`
+/// is Flash's MEDIUM — two sub-scanlines with analytic horizontal
+/// coverage — and `low` one sample per pixel, a pixel inside when its
+/// centre is. The lower two may take cheaper samplers (see SmGradient,
+/// SmPattern) that drift a step; `high` never moves a byte.
+pub const Quality = enum(u8) {
+    low = 0,
+    medium = 1,
+    high = 2,
 };
 
 pub const BlendMode = enum(u8) {
@@ -203,16 +210,10 @@ line_join: LineJoin = .miter,
 /// HTML5 `miterLimit`. Joins exceeding this ratio fall back to bevel.
 miter_limit: f64 = 10.0,
 blend_mode: BlendMode = .src_over,
-/// Antialias the coverage, or quantize it to in/out at the half-pixel.
-/// HTML5 has no such switch; FLASH does — its "low" quality setting
-/// renders with one sample per pixel, and a reference image taken that
-/// way has hard edges nothing can match with a soft one.
-antialias: bool = true,
-/// How antialiased coverage is computed (see SmScan): `.analytic` is the
-/// exact signed-area converter; `.supersample8` the eight-sub-scanline
-/// sweep it replaced, kept for A/B and for the converter's tolerance
-/// test. Irrelevant when `antialias` is false (one sample per pixel).
-aa_mode: AaMode = .analytic,
+/// Coverage quality (see `Quality`). HTML5 has no such switch; FLASH
+/// does — its stage quality — and a reference image taken at "low"
+/// has hard edges nothing can match with a soft one.
+quality: Quality = .high,
 /// Per-paint alpha modulator (0..255). Solid paints fold this into their
 /// `Shader.solid` color at construction time (`SmCanvas.applyAlphaModulation`).
 /// Gradient paints carry it through to `SmBlitter.dispatchGradient`, which

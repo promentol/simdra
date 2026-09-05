@@ -206,9 +206,9 @@ filter_blur_scratch: ?[]u8 = null,
 /// AA path-fill row accumulator. Holds per-pixel coverage in [0, 1] across
 /// the 8 sub-y-sample sweep before being packed to u8 in `aa_coverage`.
 /// Sized to `surface.width`. Lazily allocated, freed in `deinit`.
-/// Antialias path coverage. False renders one sample per pixel, which
-/// is what Flash's "low" quality does — see `SmPaint.antialias`.
-antialias: bool = true,
+/// Coverage quality for every fill, stroke and clip drawn through this
+/// context — Flash's stage quality (see `SmPaint.Quality`).
+quality: SmPaint.Quality = .high,
 aa_accum: ?[]f64 = null,
 /// AA path-fill u8 coverage row, fed to `SmBlitter.blitRow`. Sized to
 /// `surface.width`. Lazily allocated, freed in `deinit`.
@@ -748,14 +748,14 @@ inline fn applyAlphaModulation(color: u32, modulator: u8) u32 {
 /// on `paint.global_alpha` and is applied per-pixel by `SmBlitter`.
 fn paintForFill(self: *const SmCanvas) SmPaint {
     var p = paintFromShader(self.fillStyle, .fill, 0, self.alpha, self.blendMode, self.cxform, self.surface.color_type);
-    p.antialias = self.antialias;
+    p.quality = self.quality;
     return p;
 }
 
 /// Build a stroke SmPaint from the current ctx state.
 fn paintForStroke(self: *const SmCanvas) SmPaint {
     var p = paintFromShader(self.strokeStyle, .stroke, self.lineWidth, self.alpha, self.blendMode, self.cxform, self.surface.color_type);
-    p.antialias = self.antialias;
+    p.quality = self.quality;
     return p;
 }
 
@@ -1761,8 +1761,8 @@ pub fn stroke(self: *SmCanvas) void {
 // --- Spans: build once, replay at whole-pixel offsets ------------------
 
 /// Whether `fillToSpans` / `strokeToSpans` can stand in for `fill` /
-/// `stroke`: both converters are recorded — the analytic one when
-/// antialiased, the one-sample sweep (Flash's LOW quality) otherwise.
+/// `stroke`: every quality's converter is recorded — the analytic one
+/// for HIGH, the scanline sweep for MEDIUM and LOW.
 pub fn spansSupported(self: *const SmCanvas) bool {
     _ = self;
     return true;
@@ -1775,7 +1775,7 @@ pub fn spansSupported(self: *const SmCanvas) bool {
 /// than the surface); the rows kept are byte-identical either way.
 pub fn fillToSpans(self: *SmCanvas, fill_rule: SmScan.FillRule, spans: *SmSpans, y_clip: ?[2]i32) !void {
     if (!self.spansSupported()) return error.Unsupported;
-    try SmScan.fillPathToSpans(self.surface.getAllocator(), &self.path, fill_rule, self.antialias, spans, &self.sweep_scratch, y_clip);
+    try SmScan.fillPathToSpans(self.surface.getAllocator(), &self.path, fill_rule, self.quality, spans, &self.sweep_scratch, y_clip);
 }
 
 /// strokeToSpans(spans) — the current path's stroke outline as runs,
@@ -1791,7 +1791,7 @@ pub fn strokeToSpans(self: *SmCanvas, spans: *SmSpans, y_clip: ?[2]i32) !void {
         self.miterLimit,
         self.line_dash_storage.ptr[0..self.line_dash_storage.len],
         self.lineDashOffset,
-        self.antialias,
+        self.quality,
         spans,
         &self.sweep_scratch,
         y_clip,
@@ -1821,7 +1821,7 @@ pub fn strokeSpans(self: *SmCanvas, spans: *const SmSpans, dx: i32, dy: i32) voi
     const layer = self.beginCompositeLayer();
     defer self.endCompositeLayer(layer);
     var paint = paintFromShader(self.strokeStyle, .fill, 0, self.alpha, self.blendMode, self.cxform, self.surface.color_type);
-    paint.antialias = self.antialias;
+    paint.quality = self.quality;
     self.replaySpans(spans, dx, dy, &paint);
 }
 
@@ -1868,7 +1868,7 @@ fn strokeInternal(self: *SmCanvas, path: *const SmPath) void {
     // strokePath takes a fill-shaped paint (it inflates the outline polygon
     // and fills it through the same scan pipeline as fillPath).
     var paint = paintFromShader(self.strokeStyle, .fill, 0, self.alpha, self.blendMode, self.cxform, self.surface.color_type);
-    paint.antialias = self.antialias;
+    paint.quality = self.quality;
     const clip_ref = self.clipRef();
     const aa = self.ensureAaScratch() orelse return;
     SmScan.strokePath(
@@ -2021,8 +2021,7 @@ fn clipInternal(self: *SmCanvas, path: *const SmPath, fill_rule: SmScan.FillRule
             self.surface.height,
             path,
             fill_rule,
-            self.antialias,
-            .analytic,
+            self.quality,
             &box,
         ) catch {
             allocator.free(new_mask);
@@ -2145,7 +2144,7 @@ pub fn strokeTriangle(
     // strokePath takes a fill-shaped paint (it inflates the outline polygon
     // and fills it through the same scan pipeline as fillPath).
     var paint = paintFromShader(self.strokeStyle, .fill, 0, self.alpha, self.blendMode, self.cxform, self.surface.color_type);
-    paint.antialias = self.antialias;
+    paint.quality = self.quality;
     const aa = self.ensureAaScratch() orelse return;
     const clip_ref = self.clipRef();
     SmScan.strokePath(

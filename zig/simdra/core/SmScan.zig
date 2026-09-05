@@ -509,10 +509,17 @@ fn sweepFill(
         pixels: []u32,
         paint: *const SmPaint,
         clip: ?SmBlitter.Clip,
+        /// LOW: every run is 255 throughout — `blitRowFull` fills an
+        /// opaque solid outright and hands the rest to `blitRow` as is.
+        full: bool,
         fn run(self: @This(), canvas_w_: u32, x: i32, y: i32, cov: []const u8) void {
+            if (self.full) {
+                SmBlitter.blitRowFull(self.pixels, canvas_w_, x, y, @intCast(cov.len), self.paint, self.clip, cov);
+                return;
+            }
             SmBlitter.blitRow(self.pixels, canvas_w_, x, y, @intCast(cov.len), cov, self.paint, self.clip);
         }
-    }{ .pixels = pixels, .paint = paint, .clip = clip };
+    }{ .pixels = pixels, .paint = paint, .clip = clip, .full = paint.quality == .low };
     switch (converterOf(paint.quality)) {
         .analytic => {
             // Rows outside the clip's box are never deposited, let alone blitted.
@@ -683,20 +690,7 @@ pub const accum_slack: u32 = 2;
 /// the analytic overlap length (analytic-x partial coverage). After all 8
 /// sub-samples the accumulator holds the box-filtered pixel coverage in
 /// `[0, 1]` — quantized to a u8 row before being fed to `SmBlitter.blitRow`.
-/// depositSpanPoint — the ONE-SAMPLE rule: a pixel is in or out by
-/// whether its CENTRE lies in the span. Flash's "low" quality rasterizes
-/// this way, and a reference image taken that way has no partial pixels
-/// at all — approximating it by thresholding area coverage is not the
-/// same thing, because the area is itself quantized to the sub-sample
-/// grid.
-inline fn depositSpanPoint(accum: []f64, x_lo: f64, x_hi: f64, cw: i32) void {
-    const first_f = @ceil(x_lo - 0.5);
-    const last_f = @ceil(x_hi - 0.5) - 1.0;
-    var i: i32 = @max(0, @as(i32, @intFromFloat(first_f)));
-    const last: i32 = @min(cw - 1, @as(i32, @intFromFloat(last_f)));
-    while (i <= last) : (i += 1) accum[@intCast(i)] = 1.0;
-}
-
+/// The one-sample converter deposits nothing: see `sweepEdges`.
 inline fn depositSpan(accum: []f64, x_lo: f64, x_hi: f64, weight: f32, cw: i32) void {
     const cw_f: f64 = @floatFromInt(cw);
     const x_lo_c: f64 = @max(0.0, x_lo);
@@ -758,6 +752,15 @@ fn sweepEdges(
     const sub_count: u32 = sub_samples;
     // The per-sub-sample weight (exact for 1, 2 and 8: powers of two).
     const sub_weight: f32 = 1.0 / @as(f32, @floatFromInt(sub_count));
+    // One sample per pixel (LOW): a pixel is in or out by whether its
+    // CENTRE lies in a span — Flash's "low" quality rasterizes this way,
+    // and a reference image taken that way has no partial pixels at all
+    // (thresholding area coverage is not the same thing: the area is
+    // itself quantized to the sub-sample grid). Every covered pixel is
+    // 255, so a span IS a run, emitted straight from the walk over a
+    // row of 255s: no accumulator, no quantization, nothing to clear.
+    const one_sample = sub_count == 1;
+    if (one_sample) @memset(cov_row[0..canvas_w], 255);
 
     sortEdgesByYMin(allocator, edges.ptr[0..edges.len]);
 
@@ -856,20 +859,27 @@ fn sweepEdges(
                 if (!prev_inside and new_inside) {
                     span_lo = se.x;
                 } else if (prev_inside and !new_inside) {
-                    if (sub_count == 1)
-                        depositSpanPoint(aa_accum, span_lo, se.x, cw_i)
-                    else
+                    if (one_sample) {
+                        // The cells whose centre the span covers, at once.
+                        // Spans of one scanline never overlap, so no run
+                        // is emitted twice.
+                        const first: i32 = @max(0, @as(i32, @intFromFloat(@ceil(span_lo - 0.5))));
+                        const end: i32 = @min(cw_i, @as(i32, @intFromFloat(@ceil(se.x - 0.5))));
+                        if (first < end) emit.run(canvas_w, first, y_int, cov_row[@intCast(first)..@intCast(end)]);
+                    } else {
                         depositSpan(aa_accum, span_lo, se.x, sub_weight, cw_i);
-                    const lo_i: i32 = @max(0, @as(i32, @intFromFloat(@floor(span_lo))));
-                    const hi_i: i32 = @min(cw_i, @as(i32, @intFromFloat(@ceil(se.x))));
-                    if (lo_i < row_x_min) row_x_min = lo_i;
-                    if (hi_i > row_x_max) row_x_max = hi_i;
+                        const lo_i: i32 = @max(0, @as(i32, @intFromFloat(@floor(span_lo))));
+                        const hi_i: i32 = @min(cw_i, @as(i32, @intFromFloat(@ceil(se.x))));
+                        if (lo_i < row_x_min) row_x_min = lo_i;
+                        if (hi_i > row_x_max) row_x_max = hi_i;
+                    }
                 }
             }
         }
 
-        // 5. Sparse-scan accumulator and emit blits per non-zero run.
-        if (row_x_min >= row_x_max) continue;
+        // 5. Sparse-scan accumulator and emit blits per non-zero run
+        // (the one-sample rows were emitted by the walk).
+        if (one_sample or row_x_min >= row_x_max) continue;
         var x: i32 = row_x_min;
         while (x < row_x_max) {
             // Skip leading cells that round to coverage 0.
@@ -878,10 +888,6 @@ fn sweepEdges(
             const run_start = x;
             while (x < row_x_max and aa_accum[@intCast(x)] * 256.0 >= 1.0) : (x += 1) {
                 const v = aa_accum[@intCast(x)] * 256.0;
-                if (sub_count == 1) {
-                    cov_row[@intCast(x)] = if (v >= 128.0) 255 else 0;
-                    continue;
-                }
                 cov_row[@intCast(x)] = if (v >= 255.0) 255 else @intFromFloat(v);
             }
             emit.run(canvas_w, run_start, y_int, cov_row[@intCast(run_start)..@intCast(x)]);
@@ -2122,11 +2128,18 @@ fn sweepToSpans(edges: *EdgeBuf, allocator: std.mem.Allocator, fill_rule: FillRu
         allocator: std.mem.Allocator,
         x0: i32,
         y0: i32,
+        /// LOW: every run is 255 throughout, so it is a `SOLID` run
+        /// whatever its length, and the spans carry no bytes.
+        solid_only: bool,
         fn run(self: @This(), canvas_w_: u32, x: i32, y: i32, c: []const u8) void {
             _ = canvas_w_;
+            if (self.solid_only) {
+                self.spans.addSolid(self.allocator, x + self.x0, y + self.y0, @intCast(c.len));
+                return;
+            }
             self.spans.addRun(self.allocator, x + self.x0, y + self.y0, c);
         }
-    }{ .spans = spans, .allocator = allocator, .x0 = x0, .y0 = y0 };
+    }{ .spans = spans, .allocator = allocator, .x0 = x0, .y0 = y0, .solid_only = quality == .low };
     switch (converterOf(quality)) {
         .analytic => try sweepAnalytic(edges, allocator, w, h, fill_rule, scratch.accum, scratch.cov, emit, null),
         .sweep => |n| try sweepEdges(edges, allocator, w, h, fill_rule, n, scratch.accum, scratch.cov, emit),
@@ -2251,6 +2264,8 @@ test "LOW spans replay the direct one-sample fill byte for byte: 32 seeded paths
         var spans: SmSpans = .{};
         defer spans.deinit(a);
         try fillPathToSpans(a, &path, rule, .low, &spans, &scratch, null);
+        // Every LOW run is full coverage: SOLID runs only, no bytes.
+        try std.testing.expectEqual(@as(usize, 0), spans.bytes.len);
         @memset(via, 0xFFFFFFFF);
         spans.replay(via, W, H, 0, 0, &paint, null, solid);
         if (!std.mem.eql(u32, direct, via)) {

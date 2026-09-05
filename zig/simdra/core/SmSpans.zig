@@ -108,6 +108,14 @@ fn push(self: *SmSpans, allocator: std.mem.Allocator, x: i32, y: i32, cov: []con
     self.noteRun(x, y, @intCast(cov.len));
 }
 
+/// Append a run of full coverage of any length as a `SOLID` run: what
+/// the one-sample (LOW) converter emits, whose every run is 255
+/// throughout, so its spans carry no bytes at all.
+pub fn addSolid(self: *SmSpans, allocator: std.mem.Allocator, x: i32, y: i32, len: u32) void {
+    if (len == 0) return;
+    self.pushSolid(allocator, x, y, len);
+}
+
 fn pushSolid(self: *SmSpans, allocator: std.mem.Allocator, x: i32, y: i32, len: u32) void {
     self.runs.append(allocator, .{ .x = x, .y = y, .len = len, .cov = SOLID }) catch {
         self.oom = true;
@@ -164,6 +172,23 @@ pub fn replay(
             SmBlitter.blitRow(pixels, dst_w, x, y, r.len, bytes[r.cov..][0..r.len], paint, c);
         }
     }
+}
+
+test "addSolid keeps a run of any length as a SOLID run with no bytes" {
+    const a = std.testing.allocator;
+    var spans: SmSpans = .{};
+    defer spans.deinit(a);
+    spans.addSolid(a, 3, 7, 1);
+    spans.addSolid(a, 10, 7, 300);
+    spans.addSolid(a, 0, 8, 0);
+    try std.testing.expectEqual(@as(usize, 2), spans.runs.len);
+    try std.testing.expectEqual(@as(usize, 0), spans.bytes.len);
+    try std.testing.expectEqual(SOLID, spans.runs.ptr[0].cov);
+    try std.testing.expectEqual(@as(u32, 1), spans.runs.ptr[0].len);
+    try std.testing.expectEqual(SOLID, spans.runs.ptr[1].cov);
+    try std.testing.expectEqual(@as(u32, 300), spans.max_run);
+    try std.testing.expectEqual(@as(i32, 310), spans.x1);
+    try std.testing.expectEqual(@as(i32, 8), spans.y1);
 }
 
 test "addRun splits long solid stretches and keeps short ones inline" {

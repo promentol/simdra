@@ -2529,6 +2529,22 @@ fn testPath(allocator: std.mem.Allocator, r: std.Random, i: usize) !SmPath {
 /// must not move it either. `0` prints the hash instead of checking it.
 const golden_supersample8: u64 = 0x82e80ad2a7f05938;
 const golden_analytic: u64 = 0x69a51f067f3fca65;
+/// The same pixels and masks hashed by path kind: the 24 antialiased
+/// paths under each converter, and the 8 one-sample paths on their
+/// own. A change to the one-sample rule then moves `golden_low` alone,
+/// and the two antialiased constants stand as the M17 pins they are.
+/// `0` prints the hash instead of checking it.
+const golden_sweep8_aa: u64 = 0xfb564b2e0ec3f302;
+const golden_analytic_aa: u64 = 0x374f0ca2d5110c65;
+const golden_low: u64 = 0x5052e8b865a3c7c9;
+
+fn expectGolden(name: []const u8, golden: u64, got: u64) !void {
+    if (golden == 0) {
+        std.debug.print("{s} = 0x{x}\n", .{ name, got });
+        return;
+    }
+    try std.testing.expectEqual(golden, got);
+}
 
 /// The analytic converter against the supersampled sweep, over the mask
 /// bytes of the antialiased test paths where either is non-zero. First
@@ -2580,6 +2596,9 @@ test "coverage goldens and the analytic tolerance: 32 seeded paths through fillP
     defer a.free(cov);
     var h_ss = std.hash.Wyhash.init(0);
     var h_an = std.hash.Wyhash.init(0);
+    var h_ss_aa = std.hash.Wyhash.init(0);
+    var h_an_aa = std.hash.Wyhash.init(0);
+    var h_low = std.hash.Wyhash.init(0);
     var hist = [_]u64{0} ** 256;
     var sum_delta: u64 = 0;
     var count: u64 = 0;
@@ -2602,6 +2621,14 @@ test "coverage goldens and the analytic tolerance: 32 seeded paths through fillP
             @memset(mk, 0);
             try fillPathToCoverageMode(a, mk, W, H, &path, rule, aa, mode);
             hs.update(mk);
+            if (aa) {
+                const hsa = if (mode == .supersample8) &h_ss_aa else &h_an_aa;
+                hsa.update(std.mem.sliceAsBytes(px));
+                hsa.update(mk);
+            } else if (mode == .analytic) {
+                h_low.update(std.mem.sliceAsBytes(px));
+                h_low.update(mk);
+            }
         }
         if (!aa) {
             // One sample per pixel takes the same sweep in both modes.
@@ -2633,13 +2660,11 @@ test "coverage goldens and the analytic tolerance: 32 seeded paths through fillP
     }
     const mean = @as(f64, @floatFromInt(sum_delta)) / @as(f64, @floatFromInt(@max(count, 1)));
     std.debug.print("\nanalytic vs supersample8 over {d} covered pixels: mean {d:.3} LSB, p99.9 {d}, max {d} (rects {d}); pixel max {d}\n", .{ count, mean, p999, max_d, max_rect, max_px });
-    try std.testing.expectEqual(golden_supersample8, h_ss.final());
-    const h = h_an.final();
-    if (golden_analytic == 0) {
-        std.debug.print("golden_analytic = 0x{x}\n", .{h});
-    } else {
-        try std.testing.expectEqual(golden_analytic, h);
-    }
+    try expectGolden("golden_supersample8", golden_supersample8, h_ss.final());
+    try expectGolden("golden_analytic", golden_analytic, h_an.final());
+    try expectGolden("golden_sweep8_aa", golden_sweep8_aa, h_ss_aa.final());
+    try expectGolden("golden_analytic_aa", golden_analytic_aa, h_an_aa.final());
+    try expectGolden("golden_low", golden_low, h_low.final());
     try std.testing.expect(mean <= tol_mean_max);
     try std.testing.expect(p999 <= tol_p999_max);
     try std.testing.expect(max_rect <= tol_rect_max);

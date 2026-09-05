@@ -1761,9 +1761,11 @@ pub fn stroke(self: *SmCanvas) void {
 // --- Spans: build once, replay at whole-pixel offsets ------------------
 
 /// Whether `fillToSpans` / `strokeToSpans` can stand in for `fill` /
-/// `stroke`: the analytic antialiased converter is the one recorded.
+/// `stroke`: both converters are recorded — the analytic one when
+/// antialiased, the one-sample sweep (Flash's LOW quality) otherwise.
 pub fn spansSupported(self: *const SmCanvas) bool {
-    return self.antialias;
+    _ = self;
+    return true;
 }
 
 /// fillToSpans(fill_rule, spans, y_clip) — the current path's fill as
@@ -1773,7 +1775,7 @@ pub fn spansSupported(self: *const SmCanvas) bool {
 /// than the surface); the rows kept are byte-identical either way.
 pub fn fillToSpans(self: *SmCanvas, fill_rule: SmScan.FillRule, spans: *SmSpans, y_clip: ?[2]i32) !void {
     if (!self.spansSupported()) return error.Unsupported;
-    try SmScan.fillPathToSpans(self.surface.getAllocator(), &self.path, fill_rule, spans, &self.sweep_scratch, y_clip);
+    try SmScan.fillPathToSpans(self.surface.getAllocator(), &self.path, fill_rule, self.antialias, spans, &self.sweep_scratch, y_clip);
 }
 
 /// strokeToSpans(spans) — the current path's stroke outline as runs,
@@ -1789,6 +1791,7 @@ pub fn strokeToSpans(self: *SmCanvas, spans: *SmSpans, y_clip: ?[2]i32) !void {
         self.miterLimit,
         self.line_dash_storage.ptr[0..self.line_dash_storage.len],
         self.lineDashOffset,
+        self.antialias,
         spans,
         &self.sweep_scratch,
         y_clip,

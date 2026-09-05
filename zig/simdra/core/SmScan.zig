@@ -466,20 +466,20 @@ fn sweepFill(
     aa_accum: []f64,
     cov_row: []u8,
 ) !void {
+    const emit = struct {
+        pixels: []u32,
+        paint: *const SmPaint,
+        clip: ?SmBlitter.Clip,
+        fn run(self: @This(), canvas_w_: u32, x: i32, y: i32, cov: []const u8) void {
+            SmBlitter.blitRow(self.pixels, canvas_w_, x, y, @intCast(cov.len), cov, self.paint, self.clip);
+        }
+    }{ .pixels = pixels, .paint = paint, .clip = clip };
     if (paint.antialias and paint.aa_mode == .analytic) {
-        const emit = struct {
-            pixels: []u32,
-            paint: *const SmPaint,
-            clip: ?SmBlitter.Clip,
-            fn run(self: @This(), canvas_w_: u32, x: i32, y: i32, cov: []const u8) void {
-                SmBlitter.blitRow(self.pixels, canvas_w_, x, y, @intCast(cov.len), cov, self.paint, self.clip);
-            }
-        }{ .pixels = pixels, .paint = paint, .clip = clip };
         // Rows outside the clip's box are never deposited, let alone blitted.
         const y_clip: ?[2]i32 = if (clip) |c| .{ c.y0, c.y1 } else null;
         try sweepAnalytic(edges, allocator, canvas_w, canvas_h, fill_rule, aa_accum, cov_row, emit, y_clip);
     } else {
-        try sweepEdges(edges, allocator, pixels, canvas_w, canvas_h, fill_rule, clip, paint, aa_accum, cov_row);
+        try sweepEdges(edges, allocator, canvas_w, canvas_h, fill_rule, paint.antialias, aa_accum, cov_row, emit);
     }
 }
 
@@ -736,14 +736,13 @@ inline fn depositSpan(accum: []f64, x_lo: f64, x_hi: f64, weight: f32, cw: i32) 
 fn sweepEdges(
     edges: *EdgeBuf,
     allocator: std.mem.Allocator,
-    pixels: []u32,
     canvas_w: u32,
     canvas_h: u32,
     fill_rule: FillRule,
-    clip: ?SmBlitter.Clip,
-    paint: *const SmPaint,
+    antialias: bool,
     aa_accum: []f64,
     cov_row: []u8,
+    emit: anytype,
 ) !void {
     if (edges.len == 0) return;
     if (aa_accum.len < canvas_w or cov_row.len < canvas_w) return;
@@ -816,10 +815,10 @@ fn sweepEdges(
         var row_x_max: i32 = 0;
 
         // 4. Sub-y supersample sweep.
-        const sub_count: u32 = if (paint.antialias) aa_sub_count else 1;
+        const sub_count: u32 = if (antialias) aa_sub_count else 1;
         var s: u32 = 0;
         while (s < sub_count) : (s += 1) {
-            const y_sub: f64 = if (paint.antialias)
+            const y_sub: f64 = if (antialias)
                 y_top + (@as(f64, @floatFromInt(s)) + 0.5) / @as(f64, @floatFromInt(aa_sub_count))
             else
                 y_top + 0.5;
@@ -844,7 +843,7 @@ fn sweepEdges(
                 if (!prev_inside and new_inside) {
                     span_lo = se.x;
                 } else if (prev_inside and !new_inside) {
-                    if (paint.antialias)
+                    if (antialias)
                         depositSpan(aa_accum, span_lo, se.x, aa_sub_weight, cw_i)
                     else
                         depositSpanPoint(aa_accum, span_lo, se.x, cw_i);
@@ -866,23 +865,13 @@ fn sweepEdges(
             const run_start = x;
             while (x < row_x_max and aa_accum[@intCast(x)] * 256.0 >= 1.0) : (x += 1) {
                 const v = aa_accum[@intCast(x)] * 256.0;
-                if (!paint.antialias) {
+                if (!antialias) {
                     cov_row[@intCast(x)] = if (v >= 128.0) 255 else 0;
                     continue;
                 }
                 cov_row[@intCast(x)] = if (v >= 255.0) 255 else @intFromFloat(v);
             }
-            const n: u32 = @intCast(x - run_start);
-            SmBlitter.blitRow(
-                pixels,
-                canvas_w,
-                run_start,
-                y_int,
-                n,
-                cov_row[@intCast(run_start)..@intCast(x)],
-                paint,
-                clip,
-            );
+            emit.run(canvas_w, run_start, y_int, cov_row[@intCast(run_start)..@intCast(x)]);
         }
         // 6. Clear only what this row touched: every deposit lands inside
         // [row_x_min, row_x_max) (depositSpan clamps to the same bounds the
@@ -2154,8 +2143,9 @@ pub const SweepScratch = struct {
     }
 };
 
-/// fillPathToSpans — the analytic sweep of `path` (already in device
-/// space) recorded into `spans` instead of blended. The sweep runs over
+/// fillPathToSpans — the sweep of `path` (already in device space;
+/// analytic when `antialias`, one sample per pixel otherwise) recorded
+/// into `spans` instead of blended. The sweep runs over
 /// the path's own box, so nothing is clipped to a canvas width: the runs
 /// are complete and `SmSpans.replay` trims them to the surface they
 /// land on. `y_clip`, in the path's own space, limits the ROWS swept
@@ -2165,6 +2155,7 @@ pub fn fillPathToSpans(
     allocator: std.mem.Allocator,
     path: *const SmPath,
     fill_rule: FillRule,
+    antialias: bool,
     spans: *SmSpans,
     scratch: *SweepScratch,
     y_clip: ?[2]i32,
@@ -2173,7 +2164,7 @@ pub fn fillPathToSpans(
     var edges: EdgeBuf = .{};
     defer edges.deinit(allocator);
     try flattenPathToFillEdges(allocator, path, &edges);
-    try sweepToSpans(&edges, allocator, fill_rule, spans, scratch, y_clip);
+    try sweepToSpans(&edges, allocator, fill_rule, antialias, spans, scratch, y_clip);
 }
 
 /// strokePathToSpans — `strokePath`'s outline recorded like
@@ -2187,6 +2178,7 @@ pub fn strokePathToSpans(
     miter_limit: f64,
     line_dash: []const f64,
     line_dash_offset: f64,
+    antialias: bool,
     spans: *SmSpans,
     scratch: *SweepScratch,
     y_clip: ?[2]i32,
@@ -2195,13 +2187,16 @@ pub fn strokePathToSpans(
     var edges: EdgeBuf = .{};
     defer edges.deinit(allocator);
     try flattenPathToStrokeEdges(allocator, path, &edges, line_width, line_cap, line_join, miter_limit, line_dash, line_dash_offset);
-    try sweepToSpans(&edges, allocator, .nonzero, spans, scratch, y_clip);
+    try sweepToSpans(&edges, allocator, .nonzero, antialias, spans, scratch, y_clip);
 }
 
 /// Shift the edges so their box starts at (1, 0), sweep that box, and
 /// record every run shifted back. The shift is by whole pixels, so the
-/// cells a segment deposits into are the same cells, moved.
-fn sweepToSpans(edges: *EdgeBuf, allocator: std.mem.Allocator, fill_rule: FillRule, spans: *SmSpans, scratch: *SweepScratch, y_clip: ?[2]i32) !void {
+/// cells a segment deposits into are the same cells, moved. Antialiased
+/// spans come from the analytic sweep; `antialias` false records the
+/// one-sample sweep (Flash's LOW quality: a pixel is inside when its
+/// centre is), whose runs are all 255 and mostly `SOLID`.
+fn sweepToSpans(edges: *EdgeBuf, allocator: std.mem.Allocator, fill_rule: FillRule, antialias: bool, spans: *SmSpans, scratch: *SweepScratch, y_clip: ?[2]i32) !void {
     if (edges.len == 0) return;
     var min_x: f64 = std.math.inf(f64);
     var max_x: f64 = -std.math.inf(f64);
@@ -2247,7 +2242,11 @@ fn sweepToSpans(edges: *EdgeBuf, allocator: std.mem.Allocator, fill_rule: FillRu
             self.spans.addRun(self.allocator, x + self.x0, y + self.y0, c);
         }
     }{ .spans = spans, .allocator = allocator, .x0 = x0, .y0 = y0 };
-    try sweepAnalytic(edges, allocator, w, h, fill_rule, scratch.accum, scratch.cov, emit, null);
+    if (antialias) {
+        try sweepAnalytic(edges, allocator, w, h, fill_rule, scratch.accum, scratch.cov, emit, null);
+    } else {
+        try sweepEdges(edges, allocator, w, h, fill_rule, false, scratch.accum, scratch.cov, emit);
+    }
     if (spans.oom) return error.OutOfMemory;
 }
 
@@ -2298,7 +2297,7 @@ test "spans replay the direct fill byte for byte: 32 seeded paths, whole-pixel o
         try fillPath(a, direct, W, H, &path, rule, null, &paint, accum, cov);
         var spans: SmSpans = .{};
         defer spans.deinit(a);
-        try fillPathToSpans(a, &path, rule, &spans, &scratch, null);
+        try fillPathToSpans(a, &path, rule, true, &spans, &scratch, null);
         @memset(via, 0xFFFFFFFF);
         spans.replay(via, W, H, 0, 0, &paint, null, solid);
         if (!std.mem.eql(u32, direct, via)) {
@@ -2319,6 +2318,75 @@ test "spans replay the direct fill byte for byte: 32 seeded paths, whole-pixel o
             var n: usize = 0;
             for (direct, via) |d, v| n += @intFromBool(d != v);
             std.debug.print("spans mismatch: path {d} moved, {d} px\n", .{ i, n });
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 0), mismatched);
+}
+
+test "LOW spans replay the direct one-sample fill byte for byte: 32 seeded paths, whole-pixel offsets" {
+    // Every seeded path is filled directly on a canvas large enough to
+    // hold it whole (the direct sweep clips edges at the canvas border,
+    // and the split moves an f32 area share by an ulp — see the next
+    // test), and built as spans and replayed at the integer offset; a
+    // second replay two pixels down and three right must equal the
+    // direct fill of the path moved the same way.
+    const a = std.testing.allocator;
+    // Seeded coordinates run from -8 to 104, and a seeded rect can reach
+    // 64 further: 20 px of margin on the left, 100 on the right.
+    const W: u32 = 224;
+    const H: u32 = 200;
+    const direct = try a.alloc(u32, W * H);
+    defer a.free(direct);
+    const via = try a.alloc(u32, W * H);
+    defer a.free(via);
+    const accum = try a.alloc(f64, W + accum_slack);
+    defer a.free(accum);
+    @memset(accum, 0.0);
+    const cov = try a.alloc(u8, W);
+    defer a.free(cov);
+    const solid = try a.alloc(u8, 8192);
+    defer a.free(solid);
+    @memset(solid, 255);
+    var scratch: SweepScratch = .{};
+    defer scratch.deinit(a);
+    var prng = std.Random.DefaultPrng.init(0x5eed);
+    const r = prng.random();
+    var mismatched: usize = 0;
+    var i: usize = 0;
+    while (i < 32) : (i += 1) {
+        var seeded = try testPath(a, r, i);
+        defer seeded.deinit();
+        // Seeded coordinates run from -8 to 104: move them inside.
+        var path = SmPath.emptyWithAllocator(a);
+        defer path.deinit();
+        try path.addPathTransform(&seeded, &SmMatrix.components(1, 0, 0, 1, 20, 24));
+        const rule: FillRule = if (i % 2 == 0) .nonzero else .evenodd;
+        const paint: SmPaint = .{ .shader = .{ .solid = if (i % 3 == 0) 0xFF3050C0 else 0x80C05030 }, .style = .fill, .blend_mode = .src_over, .antialias = false };
+        @memset(direct, 0xFFFFFFFF);
+        try fillPath(a, direct, W, H, &path, rule, null, &paint, accum, cov);
+        var spans: SmSpans = .{};
+        defer spans.deinit(a);
+        try fillPathToSpans(a, &path, rule, false, &spans, &scratch, null);
+        @memset(via, 0xFFFFFFFF);
+        spans.replay(via, W, H, 0, 0, &paint, null, solid);
+        if (!std.mem.eql(u32, direct, via)) {
+            mismatched += 1;
+            var n: usize = 0;
+            for (direct, via) |d, v| n += @intFromBool(d != v);
+            std.debug.print("LOW spans mismatch: path {d} at offset 0, {d} px\n", .{ i, n });
+        }
+        var moved = SmPath.emptyWithAllocator(a);
+        defer moved.deinit();
+        try moved.addPathTransform(&path, &SmMatrix.components(1, 0, 0, 1, 3, 2));
+        @memset(direct, 0xFFFFFFFF);
+        try fillPath(a, direct, W, H, &moved, rule, null, &paint, accum, cov);
+        @memset(via, 0xFFFFFFFF);
+        spans.replay(via, W, H, 3, 2, &paint, null, solid);
+        if (!std.mem.eql(u32, direct, via)) {
+            mismatched += 1;
+            var n: usize = 0;
+            for (direct, via) |d, v| n += @intFromBool(d != v);
+            std.debug.print("LOW spans mismatch: path {d} moved, {d} px\n", .{ i, n });
         }
     }
     try std.testing.expectEqual(@as(usize, 0), mismatched);
@@ -2357,7 +2425,7 @@ test "spans of a path crossing the canvas border stay within one LSB of the dire
         var spans: SmSpans = .{};
         defer spans.deinit(a);
         // Rows clipped to the canvas, as a renderer would for a tall shape.
-        try fillPathToSpans(a, &path, rule, &spans, &scratch, .{ 0, @intCast(H) });
+        try fillPathToSpans(a, &path, rule, true, &spans, &scratch, .{ 0, @intCast(H) });
         @memset(via, 0xFFFFFFFF);
         spans.replay(via, W, H, 0, 0, &paint, null, solid);
         for (direct, via) |d, v| {
@@ -2414,7 +2482,7 @@ test "stroke spans replay the direct stroke, under a box clip and a mask" {
         defer spans.deinit(a);
         var scratch: SweepScratch = .{};
         defer scratch.deinit(a);
-        try strokePathToSpans(a, &path, 6.5, .round, .miter, 10.0, &.{}, 0, &spans, &scratch, null);
+        try strokePathToSpans(a, &path, 6.5, .round, .miter, 10.0, &.{}, 0, true, &spans, &scratch, null);
         @memset(via, 0xFF102030);
         spans.replay(via, W, H, 0, 0, &paint, clip, solid);
         try std.testing.expect(std.mem.eql(u32, direct, via));
